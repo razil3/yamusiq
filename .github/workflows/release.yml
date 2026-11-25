@@ -18,7 +18,9 @@ jobs:
           - runner: macos-14
             target: aarch64-apple-darwin
             arch: arm64
-          - runner: macos-13
+          # macos-13 (the last Intel image) is retired for public repositories,
+          # so the Intel slice is cross-compiled on the arm64 runner instead.
+          - runner: macos-14
             target: x86_64-apple-darwin
             arch: x86_64
     runs-on: ${{ matrix.runner }}
