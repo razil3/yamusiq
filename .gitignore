@@ -1,0 +1,9 @@
+target/
+.DS_Store
+.env
+.env.*
+!.env.example
+# Claude Code's per-machine settings stay out of the repository.
+.claude/settings.local.json
+# Release archives built by scripts/dist.sh; they belong in a GitHub release.
+dist/

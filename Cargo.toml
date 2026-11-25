@@ -1,0 +1,27 @@
+[package]
+name = "yamusiq"
+version = "1.0.0"
+edition = "2024"
+description = "Keyboard-first Yandex Music client for the terminal: TUI player, lossless streaming, local library"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.23.1"
+cpal = "0.18.2"
+crossterm = "0.29"
+hmac = "0.13.0"
+libc = "0.2"
+md-5 = "0.11.0"
+ratatui = "0.29"
+rpassword = "7.5.5"
+rustfft = "6.4.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.1"
+ureq = { version = "2", features = ["json"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

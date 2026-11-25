@@ -1,0 +1,84 @@
+name: release
+
+# Tag a commit (git tag -a v0.1.3 -m "…") and push it: this builds both
+# architectures on matching runners and attaches the archives to the release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            arch: arm64
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Pack
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/yamusiq" dist/yamusiq
+          tar -czf "dist/yamusiq-$version-${{ matrix.arch }}.tar.gz" -C dist yamusiq
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yamusiq-${{ matrix.arch }}
+          path: dist/*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Make the universal binary
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for arch in arm64 x86_64; do
+            tar -xzf "dist/yamusiq-$version-$arch.tar.gz" -C dist
+            mv dist/yamusiq "dist/yamusiq-$arch"
+          done
+          lipo -create -output dist/yamusiq dist/yamusiq-arm64 dist/yamusiq-x86_64
+          tar -czf "dist/yamusiq-$version-universal.tar.gz" -C dist yamusiq
+          rm -f dist/yamusiq dist/yamusiq-arm64 dist/yamusiq-x86_64
+
+      - name: Checksums
+        run: |
+          cd dist
+          : > SHA256SUMS
+          for f in *.tar.gz; do shasum -a 256 "$f" >> SHA256SUMS; done
+          cat SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*.tar.gz dist/SHA256SUMS
