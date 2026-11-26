@@ -4,7 +4,7 @@
 mod client;
 mod parse;
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,7 +28,7 @@ pub struct YandexService {
     uid: u64,
     name: String,
     /// Liked track ids, loaded lazily and kept in sync by `set_liked`.
-    liked: RefCell<Option<HashSet<String>>>,
+    liked: Mutex<Option<HashSet<String>>>,
 }
 
 impl YandexService {
@@ -50,15 +50,18 @@ impl YandexService {
             bail!("токен не привязан к аккаунту (нет uid)");
         };
         let login = account.get("login").and_then(Value::as_str).unwrap_or("?");
-        Ok(Self { client, uid, name: format!("YANDEX · {login}"), liked: RefCell::new(None) })
+        Ok(Self { client, uid, name: format!("YANDEX · {login}"), liked: Mutex::new(None) })
     }
 
     fn liked_ids(&self) -> Result<HashSet<String>> {
-        if let Some(set) = self.liked.borrow().as_ref() {
-            return Ok(set.clone());
+        // Take the hit, release the lock, then fetch: never hold it across a
+        // network call, or a slow request stalls every other caller.
+        let hit = self.liked.lock().unwrap().clone();
+        if let Some(set) = hit {
+            return Ok(set);
         }
         let ids: HashSet<String> = self.like_refs()?.into_iter().map(|(id, _)| id).collect();
-        *self.liked.borrow_mut() = Some(ids.clone());
+        *self.liked.lock().unwrap() = Some(ids.clone());
         Ok(ids)
     }
 
@@ -75,7 +78,7 @@ impl YandexService {
     /// Liked tracks, newest first; `limit` caps how many are fetched.
     fn liked_tracks(&self, limit: Option<usize>) -> Result<Vec<Track>> {
         let refs = self.like_refs()?;
-        *self.liked.borrow_mut() = Some(refs.iter().map(|(id, _)| id.clone()).collect());
+        *self.liked.lock().unwrap() = Some(refs.iter().map(|(id, _)| id.clone()).collect());
         let ids: Vec<String> = refs
             .into_iter()
             .take(limit.unwrap_or(usize::MAX))
@@ -252,7 +255,7 @@ impl MusicService for YandexService {
     fn set_liked(&mut self, track_id: &str, liked: bool) -> Result<()> {
         let action = if liked { "add-multiple" } else { "remove" };
         self.client.post_form(&format!("/users/{}/likes/tracks/{action}", self.uid), &[("track-ids", track_id)])?;
-        if let Some(set) = self.liked.borrow_mut().as_mut() {
+        if let Some(set) = self.liked.lock().unwrap().as_mut() {
             if liked {
                 set.insert(track_id.to_string());
             } else {
@@ -313,6 +316,20 @@ impl YandexService {
         let xml = self.client.get_text(&info_url, true)?;
         let info = parse::download_info_xml(&xml).context("download-info: неожиданный ответ")?;
         Ok(Stream { url: parse::direct_link(&info), codec, bitrate_kbps })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The service moves to a worker thread in 1.1.0, which only compiles if the
+    /// whole value is `Send`. This test is the compile-time check for that:
+    /// remove it and the guarantee quietly rots.
+    #[test]
+    fn service_can_move_between_threads() {
+        fn assert_send<T: Send>() {}
+        assert_send::<YandexService>();
     }
 }
 

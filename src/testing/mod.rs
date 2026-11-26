@@ -4,15 +4,64 @@
 
 pub mod lyrics;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+
 use anyhow::{bail, Result};
 
 use crate::model::{Lyrics, Playlist, Track};
 use crate::service::{normalize, MusicService};
 
+/// How long a parked call waits before giving up, so a forgotten release fails
+/// a test instead of hanging the suite.
+const GATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A latch the test opens when it wants the fake to answer. While it is shut,
+/// every catalogue call parks in [`Park`] and the test can inspect what the UI
+/// does with a request still in flight.
+#[derive(Clone, Default)]
+pub struct Park(Arc<ParkInner>);
+
+#[derive(Default)]
+struct ParkInner {
+    /// While true, calls wait (bounded by `timeout`).
+    holding: AtomicBool,
+    calls: AtomicUsize,
+}
+
+impl Park {
+    /// Shut the gate: catalogue calls block until [`Park::release`].
+    pub fn hold(&self) {
+        self.0.holding.store(true, Ordering::SeqCst);
+    }
+
+    /// Let everything through from now on.
+    pub fn release(&self) {
+        self.0.holding.store(false, Ordering::SeqCst);
+    }
+
+    /// How many catalogue calls have entered the gate.
+    pub fn calls(&self) -> usize {
+        self.0.calls.load(Ordering::SeqCst)
+    }
+
+    /// Wait here while the gate is shut. Bounded, so a forgotten `release`
+    /// fails a test instead of hanging the suite.
+    fn pass(&self, timeout: Duration) {
+        self.0.calls.fetch_add(1, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        while self.0.holding.load(Ordering::SeqCst) && start.elapsed() < timeout {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
 pub struct FakeService {
     tracks: Vec<Track>,
     /// Playlists with their member track ids.
     playlists: Vec<(Playlist, Vec<String>)>,
+    park: Park,
 }
 
 fn pl(id: &str, title: &str, ids: &[&str]) -> (Playlist, Vec<String>) {
@@ -57,7 +106,19 @@ impl Default for FakeService {
             pl("p2", "Фокус", &["6", "7", "4", "5"]),
             pl("p3", "По-русски", &["11", "12", "13", "14"]),
         ];
-        Self { tracks, playlists }
+        Self { tracks, playlists, park: Park::default() }
+    }
+}
+
+impl FakeService {
+    /// A fake whose catalogue calls block while the gate is held.
+    pub fn parked() -> Self {
+        Self { park: Park::default(), ..Self::default() }
+    }
+
+    /// The gate other threads (or the test) can open and close.
+    pub fn gate(&self) -> Park {
+        self.park.clone()
     }
 }
 
@@ -73,6 +134,7 @@ impl MusicService for FakeService {
     }
 
     fn search(&self, query: &str) -> Result<Vec<Track>> {
+        self.park.pass(GATE_TIMEOUT);
         let q = normalize(query.trim());
         if q.is_empty() {
             return Ok(Vec::new());
@@ -83,10 +145,12 @@ impl MusicService for FakeService {
     }
 
     fn playlists(&self) -> Result<Vec<Playlist>> {
+        self.park.pass(GATE_TIMEOUT);
         Ok(self.playlists.iter().map(|(p, _)| p.clone()).collect())
     }
 
     fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>> {
+        self.park.pass(GATE_TIMEOUT);
         let Some((_, ids)) = self.playlists.iter().find(|(p, _)| p.id == playlist_id) else {
             bail!("unknown playlist {playlist_id}");
         };
@@ -97,6 +161,7 @@ impl MusicService for FakeService {
     }
 
     fn my_wave(&self) -> Result<Vec<Track>> {
+        self.park.pass(GATE_TIMEOUT);
         // Deterministic "recommendation": everything not yet liked, then liked.
         let mut out = self.filter(|t| !t.liked);
         out.extend(self.filter(|t| t.liked));
@@ -104,14 +169,17 @@ impl MusicService for FakeService {
     }
 
     fn likes(&self) -> Result<Vec<Track>> {
+        self.park.pass(GATE_TIMEOUT);
         Ok(self.filter(|t| t.liked))
     }
 
     fn cached(&self) -> Result<Vec<Track>> {
+        self.park.pass(GATE_TIMEOUT);
         Ok(self.filter(|t| t.cached))
     }
 
     fn artist_tracks(&self, track: &Track, _all: bool) -> Result<Vec<Track>> {
+        self.park.pass(GATE_TIMEOUT);
         let a = normalize(&track.artist);
         Ok(self.filter(|t| normalize(&t.artist) == a))
     }
@@ -125,6 +193,7 @@ impl MusicService for FakeService {
     }
 
     fn lyrics(&self, track_id: &str) -> Result<Option<Lyrics>> {
+        self.park.pass(GATE_TIMEOUT);
         Ok(crate::testing::lyrics::for_track(track_id).map(Lyrics::parse))
     }
 }
@@ -132,6 +201,30 @@ impl MusicService for FakeService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_gate_parks_calls_and_release_lets_them_through() {
+        let service = FakeService::parked();
+        let gate = service.gate();
+        gate.hold();
+
+        // Ask for the likes from another thread: it should sit in the gate.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let out = service.likes().unwrap();
+            tx.send((out.len(), started.elapsed())).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(rx.try_recv().is_err(), "a parked call must not answer while the gate is shut");
+        assert_eq!(gate.calls(), 1, "the call really reached the gate");
+
+        gate.release();
+        let (len, waited) = rx.recv_timeout(Duration::from_secs(2)).expect("answer after release");
+        assert!(len > 0, "the catalogue has liked tracks");
+        assert!(waited >= Duration::from_millis(60), "it waited for the gate: {waited:?}");
+    }
 
     #[test]
     fn demo_lyrics_synced_and_plain() {
