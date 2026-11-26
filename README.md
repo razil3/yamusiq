@@ -1,5 +1,10 @@
 # yamusiq
 
+[![macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple_Silicon-242426?logo=apple&logoColor=white)](https://github.com/razil3/yamusiq/releases/latest)
+[![macOS Intel](https://img.shields.io/badge/macOS-Intel-242426?logo=apple&logoColor=white)](https://github.com/razil3/yamusiq/releases/latest)
+[![Rust](https://img.shields.io/badge/Rust-edition_2024-242426?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![crates.io](https://img.shields.io/crates/v/yamusiq?label=cargo&logo=rust&logoColor=white&color=242426)](https://crates.io/crates/yamusiq)
+
 [English](README.en.md) · **Версия 1.2.0**
 
 ![yamusiq — плеер в терминале](docs/preview-ru.png)
