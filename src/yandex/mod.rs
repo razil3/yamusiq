@@ -4,7 +4,7 @@
 mod client;
 mod parse;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,7 +28,7 @@ pub struct YandexService {
     uid: u64,
     name: String,
     /// Liked track ids, loaded lazily and kept in sync by `set_liked`.
-    liked: Mutex<Option<HashSet<String>>>,
+    liked: Arc<Mutex<Option<HashSet<String>>>>,
 }
 
 impl YandexService {
@@ -50,7 +50,7 @@ impl YandexService {
             bail!("токен не привязан к аккаунту (нет uid)");
         };
         let login = account.get("login").and_then(Value::as_str).unwrap_or("?");
-        Ok(Self { client, uid, name: format!("YANDEX · {login}"), liked: Mutex::new(None) })
+        Ok(Self { client, uid, name: format!("YANDEX · {login}"), liked: Arc::new(Mutex::new(None)) })
     }
 
     fn liked_ids(&self) -> Result<HashSet<String>> {
@@ -163,6 +163,12 @@ impl YandexService {
 }
 
 impl MusicService for YandexService {
+    fn clone_boxed(&self) -> Box<dyn MusicService> {
+        // Cheap: the HTTP agent and the liked cache are shared, so the worker
+        // and the UI see one cache, not two that drift apart.
+        Box::new(Self { client: self.client.clone(), uid: self.uid, name: self.name.clone(), liked: Arc::clone(&self.liked) })
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

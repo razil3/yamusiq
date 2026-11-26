@@ -464,10 +464,26 @@ mod tests {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
+    /// Presses a key that starts a catalogue request, then settles: the worker
+    /// answers off-thread and the UI only collects it on a tick.
+    fn press_wait(app: &mut App, code: KeyCode) {
+        press(app, code);
+        settle(app);
+    }
+
+    fn settle(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.net.is_busy() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.tick();
+        }
+        app.tick();
+    }
+
     /// Play "Static Bloom" (synced lyrics) and jump to `secs`.
     fn playing_at(secs: u64) -> App {
         let mut a = app();
-        press(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Char('w'));
         press(&mut a, KeyCode::Enter);
         a.player.seek(Duration::from_secs(secs));
         for _ in 0..40 {
@@ -486,7 +502,7 @@ mod tests {
         ] {
             assert!(idle.contains(needle), "missing {needle:?}");
         }
-        press(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Char('w'));
         press(&mut a, KeyCode::Enter);
         let screen = render(&a, 130, 40);
         for needle in ["Играет", "Static Bloom", "Моя волна", "ИСПОЛНИТЕЛЬ — ТРЕК", "буферизация", "Альбом"] {
@@ -528,7 +544,7 @@ mod tests {
         assert!(s.contains("текст скрыт"));
 
         let mut b = app();
-        press(&mut b, KeyCode::Char('w'));
+        press_wait(&mut b, KeyCode::Char('w'));
         press(&mut b, KeyCode::Char('j')); // "Low Tide": no lyrics
         press(&mut b, KeyCode::Enter);
         assert!(render(&b, 130, 40).contains("без текста"));
@@ -613,7 +629,7 @@ mod tests {
     #[test]
     fn plain_russian_lyrics_follow_progress() {
         let mut a = app();
-        press(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Char('w'));
         for _ in 0..7 {
             press(&mut a, KeyCode::Char('j')); // "Электричка": plain text, no timestamps
         }

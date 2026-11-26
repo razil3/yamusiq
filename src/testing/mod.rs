@@ -196,6 +196,12 @@ impl MusicService for FakeService {
         self.park.pass(GATE_TIMEOUT);
         Ok(crate::testing::lyrics::for_track(track_id).map(Lyrics::parse))
     }
+
+    fn clone_boxed(&self) -> Box<dyn MusicService> {
+        // The gate is shared on purpose: a test holds one gate and both the
+        // worker's copy and its own copy obey it.
+        Box::new(Self { tracks: self.tracks.clone(), playlists: self.playlists.clone(), park: self.park.clone() })
+    }
 }
 
 #[cfg(test)]

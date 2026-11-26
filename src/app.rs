@@ -11,6 +11,7 @@ use crate::library::{Finished, Library};
 use crate::sync::Sync;
 use crate::model::{Lyrics, Playlist, Quality, Track};
 use crate::player::{Player, PlayerState};
+use crate::net::{Job, Outcome, Worker};
 use crate::service::MusicService;
 
 /// The one palette: graphite field, light-grey copy, thin dim line-work and
@@ -125,6 +126,8 @@ pub enum Status {
     SearchCancelled,
     Mode(PlaybackMode),
     Home,
+    /// A catalogue request is in flight; the footer says so.
+    Loading(ListKind),
     Loaded(ListKind, usize),
     Failed(ListKind, String),
     Playing { artist: String, title: String },
@@ -167,6 +170,7 @@ impl Status {
             Self::SearchCancelled => t.st_search_cancelled.into(),
             Self::Mode(m) => fill(t.st_mode, &[m.label(lang)]),
             Self::Home => t.st_home.into(),
+            Self::Loading(kind) => format!("{} · {}", kind.title(lang), t.buffering),
             Self::Loaded(ListKind::Playlists, n) => format!("{} · {}", ListKind::Playlists.title(lang), lang.playlists(*n)),
             Self::Loaded(kind, n) => format!("{} · {}", kind.title(lang), lang.tracks(*n)),
             Self::Failed(kind, e) => fill(t.st_failed, &[&kind.title(lang), e]),
@@ -226,6 +230,18 @@ impl Rng {
 
 /// Pick the next queue index. `manual` is true when the user pressed "next",
 /// in which case LOOP still advances instead of repeating the same track.
+/// Which list a job will fill, for the footer and for the status line.
+fn job_kind(job: &Job) -> ListKind {
+    match job {
+        Job::Wave => ListKind::Wave,
+        Job::Likes => ListKind::Likes,
+        Job::Cached => ListKind::Cached,
+        Job::Playlists => ListKind::Playlists,
+        Job::PlaylistTracks { title, .. } => ListKind::Playlist(title.clone()),
+        Job::Search { query } => ListKind::Search(query.clone()),
+    }
+}
+
 pub fn next_index(mode: PlaybackMode, len: usize, current: usize, manual: bool, rng: &mut Rng) -> Option<usize> {
     if len == 0 {
         return None;
@@ -308,7 +324,11 @@ pub struct App {
     pub frame: u64,
     last_tick: Instant,
     rng: Rng,
+    /// Used directly for work that is already off the frame: the favourites
+    /// sync and the library pump. Everything a key press needs goes to `net`.
     pub service: Box<dyn MusicService>,
+    /// Catalogue calls that must never block the screen.
+    pub net: Worker,
     pub player: Box<dyn Player>,
 }
 
@@ -316,6 +336,7 @@ impl App {
     pub fn new(service: Box<dyn MusicService>, mut player: Box<dyn Player>, lang: Lang) -> Self {
         let volume = 70;
         player.set_volume(volume);
+        let net = Worker::spawn(service.clone_boxed());
         Self {
             should_quit: false,
             lang,
@@ -351,6 +372,7 @@ impl App {
             last_tick: Instant::now(),
             rng: Rng::from_time(),
             service,
+            net,
             player,
         }
     }
@@ -455,9 +477,8 @@ impl App {
                 self.status = Status::SearchCancelled;
             }
             KeyCode::Enter => {
-                let q = self.query.take().unwrap_or_default();
-                let result = self.service.search(&q);
-                self.show_tracks(ListKind::Search(q), result);
+                let query = self.query.take().unwrap_or_default();
+                self.net.post(Job::Search { query });
             }
             KeyCode::Backspace => {
                 query.pop();
@@ -493,8 +514,7 @@ impl App {
             Focus::Nav => self.open_section(Section::ALL[self.section]),
             Focus::List => match self.entries.get(self.selected).cloned() {
                 Some(Entry::Playlist(p)) => {
-                    let result = self.service.playlist_tracks(&p.id);
-                    self.show_tracks(ListKind::Playlist(p.title), result);
+                    self.await_job(Job::PlaylistTracks { id: p.id.clone(), title: p.title.clone() });
                 }
                 Some(Entry::Track(_)) => self.play_from_list(),
                 None => {}
@@ -506,36 +526,55 @@ impl App {
         if let Some(i) = Section::ALL.iter().position(|s| *s == section) {
             self.section = i;
         }
-        match section {
+        // Everything below is a request: queue it and let the frame keep coming.
+        let job = match section {
             Section::Home => {
                 self.set_entries(ListKind::Overview, Vec::new());
                 self.status = Status::Home;
+                return;
             }
-            Section::Wave => {
-                let r = self.service.my_wave();
-                self.show_tracks(ListKind::Wave, r);
-            }
-            Section::Likes => {
-                let r = self.service.likes();
-                self.show_tracks(ListKind::Likes, r);
-            }
-            Section::Cached => {
-                // The local library first, then anything the backend marks cached.
-                let r = self.service.cached().map(|backend| {
+            Section::Wave => Job::Wave,
+            Section::Likes => Job::Likes,
+            Section::Cached => Job::Cached,
+            Section::Playlists => Job::Playlists,
+        };
+        self.await_job(job);
+    }
+
+    /// Queues a catalogue job and says so in the footer while it runs.
+    fn await_job(&mut self, job: Job) {
+        let kind = job_kind(&job);
+        self.net.post(job);
+        self.status = Status::Loading(kind);
+    }
+
+    /// Takes one finished catalogue job, if the worker has one for us.
+    fn collect_job(&mut self) -> bool {
+        let Some(done) = self.net.poll() else { return false };
+        let kind = match &done.job {
+            Job::PlaylistTracks { title, .. } => ListKind::Playlist(title.clone()),
+            other => job_kind(other),
+        };
+        match done.result {
+            Ok(Outcome::Tracks(tracks)) => {
+                // "Cached" mixes the local library with what the backend keeps.
+                let tracks = if matches!(done.job, Job::Cached) {
                     let mut all = self.library.tracks();
-                    all.extend(backend.into_iter().filter(|t| !self.library.is_saved(&t.id)));
+                    all.extend(tracks.into_iter().filter(|t| !self.library.is_saved(&t.id)));
                     all
-                });
-                self.show_tracks(ListKind::Cached, r);
+                } else {
+                    tracks
+                };
+                self.status = Status::Loaded(kind.clone(), tracks.len());
+                self.set_entries(kind, tracks.into_iter().map(Entry::Track).collect());
             }
-            Section::Playlists => match self.service.playlists() {
-                Ok(ps) => {
-                    self.status = Status::Loaded(ListKind::Playlists, ps.len());
-                    self.set_entries(ListKind::Playlists, ps.into_iter().map(Entry::Playlist).collect());
-                }
-                Err(e) => self.status = Status::Failed(ListKind::Playlists, format!("{e:#}")),
-            },
+            Ok(Outcome::Playlists(ps)) => {
+                self.status = Status::Loaded(kind.clone(), ps.len());
+                self.set_entries(kind, ps.into_iter().map(Entry::Playlist).collect());
+            }
+            Err(e) => self.status = Status::Failed(kind, format!("{e:#}")),
         }
+        true
     }
 
     fn show_tracks(&mut self, kind: ListKind, result: Result<Vec<Track>>) {
@@ -907,6 +946,7 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        self.collect_job();
         if self.player.finished() {
             self.advance(false);
         }
@@ -999,8 +1039,72 @@ mod tests {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
+    /// Presses a key and waits for whatever the catalog was asked for: the
+    /// worker answers off-thread, and the UI only collects on a tick.
+    fn press_wait(app: &mut App, code: KeyCode) {
+        press(app, code);
+        settle(app);
+    }
+
+    /// Ticks until the worker's answer has landed, or the wait runs out.
+    fn settle(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.net.is_busy() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.tick();
+        }
+        app.tick();
+    }
+
     fn type_str(app: &mut App, s: &str) {
         s.chars().for_each(|c| press(app, KeyCode::Char(c)));
+    }
+
+    /// The whole point of 1.1.0: opening a section must return at once, even
+    /// when the catalogue is stuck, and the screen must keep answering.
+    #[test]
+    fn opening_a_section_does_not_wait_for_the_catalogue() {
+        use crate::testing::FakeService;
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        gate.hold();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+
+        let started = std::time::Instant::now();
+        press(&mut a, KeyCode::Char('w'));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50), "the key press returns immediately");
+        assert!(matches!(a.status, Status::Loading(ListKind::Wave)), "the footer says buffering: {:?}", a.status);
+        assert!(a.net.is_busy());
+
+        // Frames keep coming while the request is stuck.
+        for _ in 0..10 {
+            a.tick();
+        }
+        assert!(matches!(a.status, Status::Loading(ListKind::Wave)), "still waiting, and still drawing");
+
+        gate.release();
+        settle(&mut a);
+        assert_eq!(a.list, ListKind::Wave);
+        assert!(!a.entries.is_empty(), "the wave arrived");
+        assert!(matches!(a.status, Status::Loaded(ListKind::Wave, _)));
+    }
+
+    /// Moving on before an answer arrives must not paint the old list.
+    #[test]
+    fn a_superseded_section_never_lands() {
+        use crate::testing::FakeService;
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        gate.hold();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+
+        press(&mut a, KeyCode::Char('w')); // wave: queued first
+        press(&mut a, KeyCode::Char('l')); // likes: what the user actually wants
+        gate.release();
+        settle(&mut a);
+
+        assert_eq!(a.list, ListKind::Likes, "the newer request wins");
+        assert!(matches!(a.status, Status::Loaded(ListKind::Likes, _)), "no stale wave answer: {:?}", a.status);
     }
 
     #[test]
@@ -1021,12 +1125,12 @@ mod tests {
     #[test]
     fn search_keys_go_to_query_not_commands() {
         let mut a = app();
-        press(&mut a, KeyCode::Char('f'));
+        press_wait(&mut a, KeyCode::Char('f'));
         type_str(&mut a, "q");
         assert!(!a.should_quit, "'q' inside the prompt must not quit");
         press(&mut a, KeyCode::Backspace);
         type_str(&mut a, "neon");
-        press(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Enter);
         assert!(a.query.is_none());
         assert_eq!(a.entries.len(), 3);
         assert_eq!(a.focus, Focus::List);
@@ -1039,7 +1143,7 @@ mod tests {
         assert!(a.query.is_some());
         type_str(&mut a, "елки"); // must not be remapped to Latin, ё == е
         assert_eq!(a.query.as_deref(), Some("елки"));
-        press(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Enter);
         assert_eq!(a.entries.len(), 1);
         assert_eq!(a.list, ListKind::Search("елки".into()));
     }
@@ -1047,7 +1151,7 @@ mod tests {
     #[test]
     fn russian_layout_hotkeys() {
         let mut a = app();
-        press(&mut a, KeyCode::Char('ц')); // w
+        press_wait(&mut a, KeyCode::Char('ц')); // w
         assert_eq!(a.list, ListKind::Wave);
         press(&mut a, KeyCode::Enter);
         assert_eq!(a.player.state(), PlayerState::Playing);
@@ -1064,7 +1168,7 @@ mod tests {
     #[test]
     fn status_retranslates_on_language_switch() {
         let mut a = app();
-        press(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Char('w'));
         assert!(a.status.text(a.lang).starts_with("МОЯ ВОЛНА · "));
         let loaded = a.status.clone();
         press(&mut a, KeyCode::Char('i'));
@@ -1078,7 +1182,7 @@ mod tests {
         let mut a = app();
         press(&mut a, KeyCode::Char('?'));
         assert!(a.help);
-        press(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Char('w'));
         assert_eq!(a.list, ListKind::Overview);
         press(&mut a, KeyCode::Esc);
         assert!(!a.help && !a.should_quit);
@@ -1087,7 +1191,7 @@ mod tests {
     #[test]
     fn play_next_prev_and_like() {
         let mut a = app();
-        press(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Char('w'));
         press(&mut a, KeyCode::Char('j'));
         press(&mut a, KeyCode::Enter);
         assert_eq!(a.queue_pos, Some(1));
@@ -1112,9 +1216,9 @@ mod tests {
     #[test]
     fn playlist_opens_tracks_and_artist_search() {
         let mut a = app();
-        press(&mut a, KeyCode::Char('p'));
+        press_wait(&mut a, KeyCode::Char('p'));
         assert!(matches!(a.entries[0], Entry::Playlist(_)));
-        press(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Enter);
         assert_eq!(a.list, ListKind::Playlist("Ночной город".into()));
         press(&mut a, KeyCode::Enter);
         press(&mut a, KeyCode::Char('s'));
@@ -1131,7 +1235,7 @@ mod tests {
     #[test]
     fn lyrics_load_follow_and_scroll() {
         let mut a = app();
-        press(&mut a, KeyCode::Char('w')); // first wave track is "Static Bloom", which has LRC
+        press_wait(&mut a, KeyCode::Char('w')); // first wave track is "Static Bloom", which has LRC
         press(&mut a, KeyCode::Enter);
         let view = a.lyrics.as_ref().unwrap();
         assert_eq!(view.track_id, "2");
@@ -1161,7 +1265,7 @@ mod tests {
     #[test]
     fn track_without_lyrics() {
         let mut a = app();
-        press(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Char('w'));
         press(&mut a, KeyCode::Char('j')); // "Low Tide" has no lyrics
         press(&mut a, KeyCode::Enter);
         assert!(a.lyrics.as_ref().unwrap().lyrics.is_none());
@@ -1173,8 +1277,8 @@ mod tests {
     #[test]
     fn session_round_trip_resumes_paused_at_position() {
         let mut a = app();
-        press(&mut a, KeyCode::Char('p'));
-        press(&mut a, KeyCode::Enter); // open "Ночной город"
+        press_wait(&mut a, KeyCode::Char('p'));
+        press_wait(&mut a, KeyCode::Enter); // open "Ночной город"
         press(&mut a, KeyCode::Char('j'));
         press(&mut a, KeyCode::Enter); // play its 2nd track
         press(&mut a, KeyCode::Char('r'));
@@ -1230,7 +1334,7 @@ mod tests {
     #[test]
     fn save_needs_a_library_and_audio() {
         let mut a = app();
-        press(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Char('w'));
         press(&mut a, KeyCode::Char('D'));
         assert_eq!(a.status, Status::LibraryDisabled);
         let dir = std::env::temp_dir().join(format!("yamusiq-app-lib-{}", std::process::id()));

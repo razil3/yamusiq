@@ -9,6 +9,7 @@ const BASE: &str = "https://api.music.yandex.net";
 const ANDROID: &str = "YandexMusicAndroid/24023621";
 pub const DESKTOP: &str = "YandexMusicDesktopAppWindows/5.13.2";
 
+#[derive(Clone)]
 pub struct Client {
     agent: ureq::Agent,
     token: String,

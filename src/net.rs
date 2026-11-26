@@ -79,11 +79,9 @@ impl Worker {
         serial
     }
 
-    /// The job the screen is waiting for, for the "buffering" note.
-    pub fn inflight(&self) -> Option<&Job> {
-        self.inflight.as_ref().map(|(_, j)| j)
-    }
-
+    /// Whether the screen is waiting for an answer. The UI reads it for tests
+    /// and diagnostics; the footer is driven by `Status::Loading`.
+    #[allow(dead_code)]
     pub fn is_busy(&self) -> bool {
         self.inflight.is_some()
     }

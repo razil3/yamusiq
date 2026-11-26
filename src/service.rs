@@ -33,6 +33,11 @@ pub trait MusicService: Send {
     fn stream(&self, _track_id: &str, _quality: Quality) -> Result<Option<Stream>> {
         Ok(None)
     }
+
+    /// A second handle for the background worker. Implementations that share
+    /// the HTTP agent (as the Yandex one does) clone cheaply; the ones that
+    /// own mutable state rebuild themselves.
+    fn clone_boxed(&self) -> Box<dyn MusicService>;
 }
 
 /// Case-folds and treats «ё» as «е», as Russian users routinely type it.
