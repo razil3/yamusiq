@@ -23,9 +23,7 @@ Code map:
 - `src/ui/` — rendering: `mod.rs` (layout and panels), `visualizer.rs` (visualiser and lyrics overlay), `parts.rs` (header, bands, meters, card);
 - `src/testing/` — in-memory fake catalogue with original lyrics, compiled only for tests.
 
-Look: a calm monochrome terminal printout on graphite. The header carries the yamusiq mark, a half-block record whose rim glints round while music plays, next to a letter-spaced wordmark. Only the visualiser and the track table are framed; everything else is an open section with a title rule and its own key hints underneath. White is reserved for what is live.
-
-Visualiser, back to front: a spectrum skyline with peak hold along the floor, a three-step phosphor afterglow of the waveform, and the live waveform. All of these come from the audio you hear: the spectrum, the signal level and the triggered waveform, like a scope. Nothing is simulated. While a stream is loading the visualiser says "buffering", and with nothing playing it says "no signal". If the track has lyrics they rise line by line on the right, over the visualiser. Each line sits on the background colour only under its own glyphs, so the scene shows through between lines. Synced (LRC) lyrics follow the timestamps. Plain lyrics are spread over the track length. `[` / `]` scroll by hand, and the view returns to following playback 6 s after the last scroll.
+While a stream is loading the visualiser says "buffering", and with nothing playing it says "no signal". If the track has lyrics they rise line by line on the right, over the visualiser. Each line sits on the background colour only under its own glyphs, so the scene shows through between lines. Synced (LRC) lyrics follow the timestamps. Plain lyrics are spread over the track length. `[` / `]` scroll by hand, and the view returns to following playback 6 s after the last scroll.
 
 Streams come from `/get-file-info` (the desktop app's endpoint, unencrypted `raw` transport), with the legacy MP3 `download-info` as a fallback. The track card shows the quality you are actually hearing.
 
