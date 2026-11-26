@@ -2,6 +2,8 @@
 
 English version: [README.md](README.md).
 
+![yamusiq — плеер в терминале](docs/preview-ru.png)
+
 Клиент Яндекс Музыки для терминала с управлением с клавиатуры. Rust и ratatui,
 macOS на Apple Silicon и Intel.
 

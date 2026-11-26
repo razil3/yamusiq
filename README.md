@@ -2,6 +2,8 @@
 
 Русская версия: [README.ru.md](README.ru.md).
 
+![yamusiq — the player in the terminal](docs/preview-en.png)
+
 Keyboard-first Yandex Music terminal client for macOS arm64, built with Rust and ratatui.
 
 ## Current status
