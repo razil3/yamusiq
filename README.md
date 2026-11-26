@@ -98,8 +98,6 @@ Colours are 24-bit: use a truecolor terminal (iTerm2, Ghostty, WezTerm, Kitty, A
 
 Tests: `cargo test`. Live API checks (need a token): `cargo test live_ -- --ignored --nocapture`. Text dump of the rendered screen: `cargo test dump_screen -- --ignored --nocapture` (`YAMUSIQ_DUMP_AT=<seconds>` picks the playback position).
 
-Test-fixture lyrics are original texts written for fictional songs.
-
 ## Install
 
 Download the archive for your Mac and put the binary on your PATH:
