@@ -16,16 +16,24 @@ REPO="${REPO:-razil3/yamusiq}"
 VERSION="${YAMUSIQ_VERSION:-latest}"
 BASE="https://github.com/$REPO/releases"
 
-# "latest" means the most recent tag. releases/latest only answers for GitHub
-# releases, and ours are cut by hand, so ask the API for the newest tag.
+# "latest" means the newest published release, matched against the tags so the
+# tag need not be spelled with a "v".
 if [ "$VERSION" = "latest" ]; then
-    VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/tags?per_page=1" \
-        | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p' | head -1)"
+    VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=1" \
+        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
     if [ -z "$VERSION" ]; then
-        echo "yamusiq: could not work out the latest release; set YAMUSIQ_VERSION=v1.0.0" >&2
+        echo "yamusiq: could not work out the latest release; set YAMUSIQ_VERSION=1.0.0" >&2
         exit 1
     fi
 fi
+
+# Archives are named "yamusiq-<version>-<arch>.tar.gz"; the download URL keeps
+# whatever tag the release was published under, with or without the "v".
+TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/tags?per_page=100" \
+    | grep -o '"name": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' \
+    | while read -r t; do
+          [ "${t#v}" = "${VERSION#v}" ] && echo "$t" && break
+      done)"
 
 case "$(uname -s)" in
     Darwin) ;;
@@ -50,22 +58,31 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-file="yamusiq-${VERSION}-${arch}.tar.gz"
-url="$BASE/download/$VERSION/$file"
+file="yamusiq-${VERSION#v}-${arch}.tar.gz"
+tag="${TAG:-$VERSION}"
+url="$BASE/download/$tag/$file"
 echo "yamusiq: fetching $url"
+rm -f "$tmp/$file"
 if ! curl -fsSL "$url" -o "$tmp/$file"; then
     echo "yamusiq: could not download $file" >&2
     echo "yamusiq: check the release tag and that it ships a $arch build" >&2
     exit 1
 fi
 
-if curl -fsSL "$BASE/download/$VERSION/SHA256SUMS" -o "$tmp/SHA256SUMS"; then
-    (cd "$tmp" && grep " $file\$" SHA256SUMS > sums.txt && shasum -a 256 -c sums.txt)
+if curl -fsSL "$BASE/download/$tag/SHA256SUMS" -o "$tmp/SHA256SUMS"; then
+    if ! (cd "$tmp" && grep " $file\$" SHA256SUMS > sums.txt && shasum -a 256 -c sums.txt); then
+        echo "yamusiq: checksum mismatch for $file, not installing" >&2
+        exit 1
+    fi
 else
-    echo "yamusiq: no SHA256SUMS in this release, skipping verification" >&2
+    echo "yamusiq: this release has no SHA256SUMS, installing without verification" >&2
 fi
 
-tar -xzf "$tmp/$file" -C "$tmp"
+rm -rf "$tmp/x"
+if ! tar -xzf "$tmp/$file" -C "$tmp"; then
+    echo "yamusiq: $file is not a readable archive" >&2
+    exit 1
+fi
 
 # /usr/local/bin when it is writable, otherwise a per-user directory.
 bin_dir="${YAMUSIQ_BIN_DIR:-}"
