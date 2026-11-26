@@ -4,7 +4,7 @@
 //! 1. spectrum skyline along the floor — fine braille bars with peak caps;
 //! 2. phosphor afterglow — the waveform as it was 1–3 frames ago, fading;
 //! 3. the live waveform, tapered at the edges like a scope sweep;
-//! 4. lyrics on the right: each line sits on the background colour only
+//! 4. centred lyrics: each line sits on the background colour only
 //!    under its own glyphs, so the scene shows through between lines.
 
 use ratatui::{
@@ -131,7 +131,7 @@ fn scene(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
                 format_time(tr.duration())
             )
         }
-        (None, Some(tr)) if state == PlayerState::Playing => {
+        (None, Some(tr)) if state == PlayerState::Playing || app.net.loading_stream() => {
             format!("{} · {} / {}", t_txt.buffering, format_time(app.player.position()), format_time(tr.duration()))
         }
         _ => t_txt.no_signal.to_string(),
@@ -170,9 +170,9 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Lyrics column on the right of the visualiser. The current line sits at a
-/// fixed anchor a little below the middle; the text glides up as `scroll`
-/// eases towards the next line. Distance from the current line sets the tone:
+/// Centred lyrics over the visualiser. The current line sits at the vertical
+/// centre; the text glides up as `scroll` eases towards the next line.
+/// Distance from the current line sets the tone:
 /// bright now, soft grey next, fading into the background behind.
 fn lyrics(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
     let t = app.lang.t();
@@ -198,15 +198,14 @@ fn lyrics(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
         corner(buf, t.lyrics_plain);
     }
 
-    // Column: the right ~64% on wide screens (at least 36 cells so lines
-    // rarely wrap), full width when narrow.
-    let (col_x, col_w) = if inner.width >= 52 {
-        let w = (inner.width * 64 / 100).max(36).min(inner.width);
-        (inner.width - w, w)
+    // Keep a readable column width, but centre every wrapped row in the
+    // entire visualiser rather than anchoring the column to its right edge.
+    let col_w = if inner.width >= 52 {
+        (inner.width * 64 / 100).max(36).min(inner.width)
     } else {
-        (0, inner.width)
+        inner.width
     };
-    let text_w = usize::from(col_w.saturating_sub(3));
+    let text_w = usize::from(col_w.saturating_sub(4));
 
     // Wrapped rows and the first row of each lyric line.
     let mut rows: Vec<(usize, String)> = Vec::new();
@@ -228,7 +227,7 @@ fn lyrics(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
         let f = s - i as f64;
         starts[i] + f * (starts[i + 1] - starts[i])
     };
-    let anchor = f64::from(inner.height) * 0.56;
+    let anchor = f64::from(inner.height) / 2.0;
     let offset = row_of(view.scroll);
     let current = app.lyric_line().map(|c| c.round() as i64);
 
@@ -255,16 +254,15 @@ fn lyrics(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
         if bold {
             style = style.add_modifier(Modifier::BOLD);
         }
-        // "›" marks the first row of the line being sung.
+        // Centre the text itself; the current-line marker must not shift it.
+        let x = inner.width.saturating_sub(text_width(text) as u16) / 2;
         let marker = if d == 0 && r as f64 == starts[*li] { "› " } else { "  " };
-        let line = format!("{marker}{text} ");
         let marker_style = Style::default().fg(p.muted).bg(p.bg);
-        set_str(buf, inner, col_x, y, &line, style);
-        set_str(buf, inner, col_x, y, marker, marker_style);
-        // One cell of breathing space to the left of the text block.
-        if col_x > 0 {
-            set_str(buf, inner, col_x - 1, y, " ", Style::default().bg(p.bg));
+        if x >= 2 {
+            set_str(buf, inner, x - 2, y, marker, marker_style);
         }
+        set_str(buf, inner, x, y, text, style);
+        set_str(buf, inner, x + text_width(text) as u16, y, " ", Style::default().bg(p.bg));
     }
 }
 

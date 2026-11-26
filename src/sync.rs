@@ -13,6 +13,7 @@ pub const PARALLEL: usize = 2;
 pub struct Sync {
     pending: VecDeque<Track>,
     in_flight: HashSet<String>,
+    cancelled: bool,
     /// Tracks this run has to fetch (already-saved ones are not counted).
     pub total: usize,
     /// Liked tracks that were already in the library at the start.
@@ -27,7 +28,7 @@ impl Sync {
         let unique: Vec<Track> = liked.into_iter().filter(|t| seen.insert(t.id.clone())).collect();
         let already = unique.iter().filter(|t| lib.is_saved(&t.id)).count();
         let pending: VecDeque<Track> = unique.into_iter().filter(|t| !lib.is_saved(&t.id)).collect();
-        Self { total: pending.len(), pending, in_flight: HashSet::new(), already, saved: 0, failed: 0 }
+        Self { total: pending.len(), pending, in_flight: HashSet::new(), cancelled: false, already, saved: 0, failed: 0 }
     }
 
     pub fn is_done(&self) -> bool {
@@ -47,11 +48,14 @@ impl Sync {
         ((self.finished_count() as f64 + partial) / self.total as f64).clamp(0.0, 1.0)
     }
 
-    /// Start downloads while there is room. Stream links are fetched just in
-    /// time because they expire.
-    pub fn pump(&mut self, lib: &mut Library, service: &dyn MusicService, quality: Quality) {
-        while lib.active() < PARALLEL {
-            let Some(track) = self.pending.pop_front() else { return };
+    /// Takes the next batch of tracks to fetch. The stream links themselves come
+    /// from the background worker, one job per track; `finish_stream` starts the
+    /// download when a link arrives.
+    pub fn next_batch(&mut self, lib: &Library, want: usize) -> Vec<Track> {
+        let mut out = Vec::new();
+        if self.cancelled { return out; }
+        while out.len() < want {
+            let Some(track) = self.pending.pop_front() else { break };
             if lib.is_saved(&track.id) {
                 self.saved += 1; // saved meanwhile (e.g. by hand)
                 continue;
@@ -60,11 +64,33 @@ impl Sync {
                 self.in_flight.insert(track.id.clone()); // already running (auto-download)
                 continue;
             }
-            match service.stream(&track.id, quality) {
-                Ok(Some(stream)) if lib.start(&track, &stream).is_ok() => {
-                    self.in_flight.insert(track.id.clone());
+            self.in_flight.insert(track.id.clone());
+            out.push(track);
+        }
+        out
+    }
+
+    /// A track the sync wanted could not be fetched.
+    pub fn mark_failed(&mut self, track_id: &str) {
+        if self.in_flight.remove(track_id) {
+            self.failed += 1;
+        }
+    }
+
+    /// How many slots are free for new downloads.
+    pub fn free_slots(&self, lib: &Library) -> usize {
+        PARALLEL.saturating_sub(lib.active().max(self.in_flight.len()))
+    }
+
+    /// CLI callers have no UI thread and may fetch links synchronously.
+    pub fn pump(&mut self, lib: &mut Library, service: &dyn MusicService, quality: Quality) {
+        while !self.cancelled && self.free_slots(lib) > 0 && !self.pending.is_empty() {
+            let tracks = self.next_batch(lib, self.free_slots(lib));
+            for track in tracks {
+                match service.stream(&track.id, quality) {
+                    Ok(Some(stream)) if lib.start(&track, &stream).is_ok() => {}
+                    _ => self.mark_failed(&track.id),
                 }
-                _ => self.failed += 1,
             }
         }
     }
@@ -83,7 +109,9 @@ impl Sync {
 
     /// Stop queueing new downloads; running ones finish on their own.
     pub fn cancel(&mut self) {
+        self.cancelled = true;
         self.pending.clear();
+        self.in_flight.clear();
     }
 }
 
@@ -110,6 +138,20 @@ mod tests {
         assert!(sync.is_done());
         assert_eq!(sync.failed, n);
         assert_eq!(sync.fraction(&lib), 1.0);
+    }
+
+    #[test]
+    fn link_requests_count_towards_the_parallel_limit() {
+        let lib = Library::disabled();
+        let mut sync = Sync::new(FakeService::default().likes().unwrap(), &lib);
+        let batch = sync.next_batch(&lib, sync.free_slots(&lib));
+        assert_eq!(batch.len(), PARALLEL);
+        assert_eq!(sync.free_slots(&lib), 0, "links awaiting a response occupy slots too");
+        sync.mark_failed(&batch[0].id);
+        assert_eq!(sync.free_slots(&lib), 1);
+        sync.cancel();
+        assert!(sync.next_batch(&lib, PARALLEL).is_empty());
+        assert!(sync.is_done());
     }
 
     #[test]

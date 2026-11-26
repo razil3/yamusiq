@@ -480,11 +480,33 @@ mod tests {
         app.tick();
     }
 
+    #[test]
+    fn loading_stream_renders_buffering_and_keeps_keyboard_working() {
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('w'));
+        gate.hold();
+        press(&mut a, KeyCode::Enter);
+        assert!(a.net.loading_stream());
+        for _ in 0..5 {
+            a.tick();
+            assert!(render(&a, 130, 40).contains("буферизация"));
+        }
+        press(&mut a, KeyCode::Char('-'));
+        assert_eq!(a.volume, 65);
+        press(&mut a, KeyCode::Char('i'));
+        assert!(render(&a, 130, 40).contains("buffering"));
+        gate.release();
+        settle(&mut a);
+        assert!(!a.net.loading_stream());
+    }
+
     /// Play "Static Bloom" (synced lyrics) and jump to `secs`.
     fn playing_at(secs: u64) -> App {
         let mut a = app();
         press_wait(&mut a, KeyCode::Char('w'));
-        press(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Enter);
         a.player.seek(Duration::from_secs(secs));
         for _ in 0..40 {
             a.tick();
@@ -503,7 +525,7 @@ mod tests {
             assert!(idle.contains(needle), "missing {needle:?}");
         }
         press_wait(&mut a, KeyCode::Char('w'));
-        press(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Enter);
         let screen = render(&a, 130, 40);
         for needle in ["Играет", "Static Bloom", "Моя волна", "ИСПОЛНИТЕЛЬ — ТРЕК", "буферизация", "Альбом"] {
             assert!(screen.contains(needle), "missing {needle:?}");
@@ -536,6 +558,31 @@ mod tests {
     }
 
     #[test]
+    fn lyrics_stay_centred_at_different_visualizer_sizes() {
+        let mut a = playing_at(0);
+        let view = a.lyrics.as_mut().unwrap();
+        view.lyrics = Some(crate::model::Lyrics::parse(
+            "[00:00.00]Short\n[00:10.00]A longer line\n[00:20.00]Тихий свет",
+        ));
+        view.scroll = 0.0;
+        for width in [24, 51, 80, 121] {
+            for height in [12, 21] {
+                let area = ratatui::layout::Rect::new(5, 3, width, height);
+                let mut term = Terminal::new(TestBackend::new(width + 10, height + 6)).unwrap();
+                term.draw(|f| super::visualizer::draw(f, area, &a, &PALETTE)).unwrap();
+                let buf = term.backend().buffer();
+                let inner = ratatui::layout::Rect::new(area.x + 2, area.y + 1, width - 4, height - 2);
+                for (i, text) in ["Short", "A longer line", "Тихий свет"].iter().enumerate() {
+                    let y = inner.y + (f64::from(inner.height) / 2.0).round() as u16 + i as u16;
+                    let x = inner.x + (inner.width - super::text_width(text) as u16) / 2;
+                    let actual: String = (x..x + super::text_width(text) as u16).map(|x| buf[(x, y)].symbol()).collect();
+                    assert_eq!(actual, *text, "{width}×{height}: row {i} is centred");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn lyrics_can_be_hidden_and_absent_lyrics_are_labelled() {
         let mut a = playing_at(38);
         press(&mut a, KeyCode::Char('y'));
@@ -546,7 +593,7 @@ mod tests {
         let mut b = app();
         press_wait(&mut b, KeyCode::Char('w'));
         press(&mut b, KeyCode::Char('j')); // "Low Tide": no lyrics
-        press(&mut b, KeyCode::Enter);
+        press_wait(&mut b, KeyCode::Enter);
         assert!(render(&b, 130, 40).contains("без текста"));
     }
 
@@ -633,7 +680,7 @@ mod tests {
         for _ in 0..7 {
             press(&mut a, KeyCode::Char('j')); // "Электричка": plain text, no timestamps
         }
-        press(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Enter);
         assert_eq!(a.current_track().unwrap().title, "Электричка");
         for _ in 0..40 {
             a.tick();

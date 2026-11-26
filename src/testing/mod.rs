@@ -4,13 +4,13 @@
 
 pub mod lyrics;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 
-use crate::model::{Lyrics, Playlist, Track};
+use crate::model::{Lyrics, Playlist, Quality, Stream, Track};
 use crate::service::{normalize, MusicService};
 
 /// How long a parked call waits before giving up, so a forgotten release fails
@@ -54,14 +54,16 @@ impl Park {
         while self.0.holding.load(Ordering::SeqCst) && start.elapsed() < timeout {
             std::thread::sleep(Duration::from_millis(2));
         }
+        assert!(!self.0.holding.load(Ordering::SeqCst), "test gate timed out without release");
     }
 }
 
 pub struct FakeService {
-    tracks: Vec<Track>,
+    tracks: Arc<Mutex<Vec<Track>>>,
     /// Playlists with their member track ids.
     playlists: Vec<(Playlist, Vec<String>)>,
     park: Park,
+    reject_likes: bool,
 }
 
 fn pl(id: &str, title: &str, ids: &[&str]) -> (Playlist, Vec<String>) {
@@ -106,7 +108,7 @@ impl Default for FakeService {
             pl("p2", "Фокус", &["6", "7", "4", "5"]),
             pl("p3", "По-русски", &["11", "12", "13", "14"]),
         ];
-        Self { tracks, playlists, park: Park::default() }
+        Self { tracks: Arc::new(Mutex::new(tracks)), playlists, park: Park::default(), reject_likes: false }
     }
 }
 
@@ -123,8 +125,13 @@ impl FakeService {
 }
 
 impl FakeService {
+    pub fn reject_likes(mut self) -> Self {
+        self.reject_likes = true;
+        self
+    }
+
     fn filter(&self, pred: impl Fn(&Track) -> bool) -> Vec<Track> {
-        self.tracks.iter().filter(|t| pred(t)).cloned().collect()
+        self.tracks.lock().unwrap().iter().filter(|t| pred(t)).cloned().collect()
     }
 }
 
@@ -156,7 +163,7 @@ impl MusicService for FakeService {
         };
         Ok(ids
             .iter()
-            .filter_map(|id| self.tracks.iter().find(|t| &t.id == id).cloned())
+            .filter_map(|id| self.tracks.lock().unwrap().iter().find(|t| &t.id == id).cloned())
             .collect())
     }
 
@@ -185,7 +192,10 @@ impl MusicService for FakeService {
     }
 
     fn set_liked(&mut self, track_id: &str, liked: bool) -> Result<()> {
-        let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
+        self.park.pass(GATE_TIMEOUT);
+        if self.reject_likes { bail!("test: like rejected"); }
+        let mut tracks = self.tracks.lock().unwrap();
+        let Some(track) = tracks.iter_mut().find(|t| t.id == track_id) else {
             bail!("unknown track {track_id}");
         };
         track.liked = liked;
@@ -197,10 +207,15 @@ impl MusicService for FakeService {
         Ok(crate::testing::lyrics::for_track(track_id).map(Lyrics::parse))
     }
 
+    fn stream(&self, _track_id: &str, _quality: Quality) -> Result<Option<Stream>> {
+        self.park.pass(GATE_TIMEOUT);
+        Ok(None)
+    }
+
     fn clone_boxed(&self) -> Box<dyn MusicService> {
         // The gate is shared on purpose: a test holds one gate and both the
         // worker's copy and its own copy obey it.
-        Box::new(Self { tracks: self.tracks.clone(), playlists: self.playlists.clone(), park: self.park.clone() })
+        Box::new(Self { tracks: self.tracks.clone(), playlists: self.playlists.clone(), park: self.park.clone(), reject_likes: self.reject_likes })
     }
 }
 

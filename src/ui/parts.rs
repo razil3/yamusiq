@@ -96,6 +96,7 @@ fn emblem(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
 
 pub(super) fn state_label(app: &App) -> &'static str {
     let t = app.lang.t();
+    if app.net.loading_stream() { return t.buffering; }
     match app.player.state() {
         PlayerState::Playing => t.states[0],
         PlayerState::Paused => t.states[1],

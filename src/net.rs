@@ -6,6 +6,7 @@
 //! picks results up. Every job carries a serial number, so an answer that has
 //! been overtaken by a newer request is dropped instead of landing on screen.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
@@ -16,11 +17,40 @@ use crate::service::MusicService;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Job {
     Wave,
+    SyncLikes,
     Likes,
     Cached,
     Playlists,
     PlaylistTracks { id: String, title: String },
     Search { query: String },
+    /// Play `track`; the worker resolves the stream (or plays a saved copy).
+    Stream { track: Track, quality: crate::model::Quality, position: usize },
+    Artist { track: Track, all: bool },
+    Lyrics { track_id: String },
+    /// Set or clear the like on a track.
+    Like { track_id: String, liked: bool },
+    /// The link that saving a track needs, fetched on demand.
+    SaveStream { track: Track, quality: crate::model::Quality },
+    /// A stream of the same track in another quality tier.
+    QualityStream { track: Track, quality: crate::model::Quality },
+    /// A stream for the favourites sync (needs its own handle).
+    SyncStream { track: Track, quality: crate::model::Quality },
+}
+
+impl Job {
+    // Supersession is local to a task category. Opening a list must never
+    // discard playback, a like acknowledgement or a download link.
+    fn lane(&self) -> String {
+        match self {
+            Self::Stream { .. } | Self::QualityStream { .. } => "playback".into(),
+            Self::Lyrics { .. } => "lyrics".into(),
+            Self::Like { track_id, .. } => format!("like:{track_id}"),
+            Self::SaveStream { track, .. } => format!("save:{}", track.id),
+            Self::SyncStream { track, .. } => format!("sync:{}", track.id),
+            Self::SyncLikes => "sync-likes".into(),
+            _ => "list".into(),
+        }
+    }
 }
 
 /// What came back, tagged with the serial of the job that asked for it.
@@ -35,6 +65,13 @@ pub struct Done {
 pub enum Outcome {
     Tracks(Vec<Track>),
     Playlists(Vec<crate::model::Playlist>),
+    /// A playable source, or none when the backend has no audio for the track.
+    Stream(Option<crate::model::Stream>),
+    Lyrics(Option<crate::model::Lyrics>),
+    /// `set_liked` finished.
+    Liked,
+    /// A stream requested for saving, a quality switch or the sync.
+    Fetched(Option<crate::model::Stream>),
 }
 
 /// Handles to the worker: post a job, or collect what it finished.
@@ -42,8 +79,8 @@ pub struct Worker {
     jobs: Sender<(u64, Job)>,
     done: Receiver<Done>,
     next_serial: u64,
-    /// The job whose answer the screen is waiting for, if any.
-    inflight: Option<(u64, Job)>,
+    /// Latest request per independent operation category.
+    inflight: HashMap<String, (u64, Job)>,
 }
 
 impl Worker {
@@ -65,25 +102,49 @@ impl Worker {
             })
             .expect("spawn the network worker");
 
-        Self { jobs: job_tx, done: done_rx, next_serial: 1, inflight: None }
+        Self { jobs: job_tx, done: done_rx, next_serial: 1, inflight: HashMap::new() }
     }
 
-    /// Queues a job and records it as the one the screen now waits for. Any
-    /// earlier answer still on its way becomes stale by comparison.
+    /// Queues a job. Only an earlier request in the same category is replaced.
     pub fn post(&mut self, job: Job) -> u64 {
         let serial = self.next_serial;
         self.next_serial += 1;
-        self.inflight = Some((serial, job.clone()));
-        // If the worker is gone the app is shutting down; nothing to report.
+        self.inflight.insert(job.lane(), (serial, job.clone()));
+        // poll() reports a disconnected worker as an error for pending jobs.
         let _ = self.jobs.send((serial, job));
         serial
     }
 
     /// Whether the screen is waiting for an answer. The UI reads it for tests
     /// and diagnostics; the footer is driven by `Status::Loading`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_busy(&self) -> bool {
-        self.inflight.is_some()
+        !self.inflight.is_empty()
+    }
+
+    pub fn liking(&self, id: &str) -> bool {
+        self.inflight.contains_key(&format!("like:{id}"))
+    }
+
+    pub fn cancel_list(&mut self) {
+        self.inflight.remove("list");
+    }
+
+    pub fn cancel_playback(&mut self) {
+        self.inflight.remove("playback");
+        self.inflight.remove("lyrics");
+    }
+
+    pub fn loading_stream(&self) -> bool {
+        self.inflight.contains_key("playback")
+    }
+
+    pub fn loading_sync(&self) -> bool {
+        self.inflight.contains_key("sync-likes")
+    }
+
+    pub fn cancel_sync(&mut self) {
+        self.inflight.retain(|key, _| key != "sync-likes" && !key.starts_with("sync:"));
     }
 
     /// Collects one finished job, if any. Answers to a superseded request and
@@ -92,15 +153,22 @@ impl Worker {
         loop {
             match self.done.try_recv() {
                 Ok(done) => {
-                    let current = self.inflight.as_ref().is_some_and(|(s, _)| *s == done.serial);
+                    let lane = done.job.lane();
+                    let current = self.inflight.get(&lane).is_some_and(|(serial, _)| *serial == done.serial);
                     if !current {
                         continue; // overtaken while in flight
                     }
-                    self.inflight = None;
+                    self.inflight.remove(&lane);
                     return Some(done);
                 }
                 Err(TryRecvError::Empty) => return None,
-                Err(TryRecvError::Disconnected) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    // A dead worker must fail pending jobs, not leave the UI
+                    // in buffering forever (also restores optimistic likes).
+                    let lane = self.inflight.keys().next()?.clone();
+                    let (serial, job) = self.inflight.remove(&lane)?;
+                    return Some(Done { serial, job, result: Err(anyhow::anyhow!("network worker disconnected")) });
+                }
             }
         }
     }
@@ -109,11 +177,22 @@ impl Worker {
 fn run(service: &mut dyn MusicService, job: &Job) -> anyhow::Result<Outcome> {
     Ok(match job {
         Job::Wave => Outcome::Tracks(service.my_wave()?),
+        Job::SyncLikes => Outcome::Tracks(service.likes_all()?),
         Job::Likes => Outcome::Tracks(service.likes()?),
         Job::Cached => Outcome::Tracks(service.cached()?),
         Job::Playlists => Outcome::Playlists(service.playlists()?),
         Job::PlaylistTracks { id, .. } => Outcome::Tracks(service.playlist_tracks(id)?),
         Job::Search { query } => Outcome::Tracks(service.search(query)?),
+        Job::Stream { track, quality, .. } => Outcome::Stream(service.stream(&track.id, *quality)?),
+        Job::Artist { track, all } => Outcome::Tracks(service.artist_tracks(track, *all)?),
+        Job::Lyrics { track_id } => Outcome::Lyrics(service.lyrics(track_id)?),
+        Job::Like { track_id, liked } => {
+            service.set_liked(track_id, *liked)?;
+            Outcome::Liked
+        }
+        Job::SaveStream { track, quality }
+        | Job::QualityStream { track, quality }
+        | Job::SyncStream { track, quality } => Outcome::Fetched(service.stream(&track.id, *quality)?),
     })
 }
 
@@ -159,6 +238,22 @@ mod tests {
         let Outcome::Tracks(tracks) = done.result.unwrap() else { panic!("tracks expected") };
         assert!(!tracks.is_empty());
         assert!(!worker.is_busy(), "the screen stops saying buffering");
+    }
+
+    #[test]
+    fn a_disconnected_worker_reports_failure_and_clears_busy() {
+        let (jobs, job_rx) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        drop(job_rx);
+        drop(done_tx);
+        let mut worker = Worker { jobs, done, next_serial: 1, inflight: HashMap::new() };
+        worker.post(Job::Likes);
+        assert!(worker.is_busy());
+        let answer = worker.poll().expect("failure for the pending request");
+        assert_eq!(answer.job, Job::Likes);
+        assert!(answer.result.is_err());
+        assert!(!worker.is_busy());
+        assert!(worker.poll().is_none());
     }
 
     #[test]

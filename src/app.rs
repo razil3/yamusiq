@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Color;
@@ -239,6 +238,18 @@ fn job_kind(job: &Job) -> ListKind {
         Job::Playlists => ListKind::Playlists,
         Job::PlaylistTracks { title, .. } => ListKind::Playlist(title.clone()),
         Job::Search { query } => ListKind::Search(query.clone()),
+        Job::Artist { track, all } => {
+            let name = track.artist.split(", ").next().unwrap_or(&track.artist).to_string();
+            if *all { ListKind::ArtistAll(name) } else { ListKind::Artist(name) }
+        }
+        // These do not fill a list; the status line describes them itself.
+        Job::SyncLikes
+        | Job::Stream { .. }
+        | Job::Lyrics { .. }
+        | Job::Like { .. }
+        | Job::SaveStream { .. }
+        | Job::QualityStream { .. }
+        | Job::SyncStream { .. } => ListKind::Overview,
     }
 }
 
@@ -316,6 +327,10 @@ pub struct App {
     pub library: Library,
     /// Track awaiting a second `D` to delete its file, and when asked.
     pending_remove: Option<(String, Instant)>,
+    /// Where to seek and pause once a restored track's stream arrives.
+    pending_resume: Option<(usize, Duration)>,
+    /// Track, position and pause state to restore after a quality switch.
+    pending_quality: Option<(String, Duration, bool)>,
     /// Favourites sync in progress (⌥⇧D / --download-fav).
     pub sync: Option<Sync>,
     /// Save every track that starts playing (--download-all).
@@ -324,8 +339,8 @@ pub struct App {
     pub frame: u64,
     last_tick: Instant,
     rng: Rng,
-    /// Used directly for work that is already off the frame: the favourites
-    /// sync and the library pump. Everything a key press needs goes to `net`.
+    /// Backend identity and shared handle. All TUI network calls go through
+    /// `net`; keeping the handle also lets tests inspect the shared fake.
     pub service: Box<dyn MusicService>,
     /// Catalogue calls that must never block the screen.
     pub net: Worker,
@@ -365,6 +380,8 @@ impl App {
             playing_local: false,
             library: Library::disabled(),
             pending_remove: None,
+            pending_resume: None,
+            pending_quality: None,
             sync: None,
             auto_download: false,
             show_lyrics: true,
@@ -478,7 +495,7 @@ impl App {
             }
             KeyCode::Enter => {
                 let query = self.query.take().unwrap_or_default();
-                self.net.post(Job::Search { query });
+                self.await_job(Job::Search { query });
             }
             KeyCode::Backspace => {
                 query.pop();
@@ -529,6 +546,7 @@ impl App {
         // Everything below is a request: queue it and let the frame keep coming.
         let job = match section {
             Section::Home => {
+                self.net.cancel_list();
                 self.set_entries(ListKind::Overview, Vec::new());
                 self.status = Status::Home;
                 return;
@@ -551,10 +569,43 @@ impl App {
     /// Takes one finished catalogue job, if the worker has one for us.
     fn collect_job(&mut self) -> bool {
         let Some(done) = self.net.poll() else { return false };
-        let kind = match &done.job {
-            Job::PlaylistTracks { title, .. } => ListKind::Playlist(title.clone()),
-            other => job_kind(other),
-        };
+        // Stream and lyrics answers are not list loads; hand them to their own
+        // handlers so the status line keeps saying "playing" / "buffering".
+        if let Job::Stream { track, position, .. } = &done.job {
+            return self.finish_stream(track.clone(), *position, done.result);
+        }
+        if let Job::Lyrics { track_id } = &done.job {
+            return self.finish_lyrics(track_id.clone(), done.result);
+        }
+        if let Job::Like { track_id, liked } = &done.job {
+            return self.finish_like(track_id.clone(), *liked, done.result);
+        }
+        if let Job::SaveStream { track, .. } = &done.job {
+            return self.finish_save_stream(track.clone(), done.result);
+        }
+        if let Job::QualityStream { track, .. } = &done.job {
+            return self.finish_quality_stream(track.clone(), done.result);
+        }
+        if let Job::SyncStream { track, .. } = &done.job {
+            return self.finish_sync_stream(track.clone(), done.result);
+        }
+        if done.job == Job::SyncLikes {
+            match done.result {
+                Ok(Outcome::Tracks(liked)) => {
+                    let sync = Sync::new(liked, &self.library);
+                    if sync.total == 0 {
+                        self.status = Status::SyncNothing(sync.already);
+                    } else {
+                        self.status = Status::SyncStarted { todo: sync.total, already: sync.already };
+                        self.sync = Some(sync);
+                    }
+                }
+                Err(e) => self.status = Status::SyncFailed(format!("{e:#}")),
+                _ => {}
+            }
+            return true;
+        }
+        let kind = job_kind(&done.job);
         match done.result {
             Ok(Outcome::Tracks(tracks)) => {
                 // "Cached" mixes the local library with what the backend keeps.
@@ -572,19 +623,70 @@ impl App {
                 self.status = Status::Loaded(kind.clone(), ps.len());
                 self.set_entries(kind, ps.into_iter().map(Entry::Playlist).collect());
             }
+            Ok(Outcome::Stream(_) | Outcome::Lyrics(_) | Outcome::Liked | Outcome::Fetched(_)) => {}
             Err(e) => self.status = Status::Failed(kind, format!("{e:#}")),
         }
         true
     }
 
-    fn show_tracks(&mut self, kind: ListKind, result: Result<Vec<Track>>) {
-        match result {
-            Ok(tracks) => {
-                self.status = Status::Loaded(kind.clone(), tracks.len());
-                self.set_entries(kind, tracks.into_iter().map(Entry::Track).collect());
-            }
-            Err(e) => self.status = Status::Failed(kind, format!("{e:#}")),
+    /// The stream for a track arrived: play it, keep the queue position, and
+    /// clear the buffering note.
+    fn finish_stream(&mut self, track: Track, position: usize, result: anyhow::Result<Outcome>) -> bool {
+        // The user may have moved on; a stale stream must not start playing.
+        if self.queue_pos != Some(position) || self.current_track().is_none_or(|t| t.id != track.id) {
+            return true;
         }
+        let source = match result {
+            Ok(Outcome::Stream(source)) => source,
+            Ok(_) => None,
+            Err(e) => {
+                self.player.stop();
+                self.status = Status::StreamFailed(format!("{e:#}"));
+                return true;
+            }
+        };
+        self.player.play(&track, source.as_ref().map(|s| s.url.as_str()));
+        if self.auto_download
+            && !self.playing_local
+            && !self.library.is_saved(&track.id)
+            && let Some(src) = &source
+        {
+            let _ = self.library.start(&track, src);
+        }
+        self.set_quality_from(source.as_ref());
+        if self.playing_local
+            && let Some(q) = self.quality.as_mut()
+        {
+            q.push_str(" · ");
+            q.push_str(self.lang.t().from_disk);
+        }
+        // Restoring a session resumes paused at the saved second.
+        if let Some((at_pos, at)) = self.pending_resume.take()
+            && at_pos == position
+        {
+            self.player.seek(at);
+            self.player.toggle_pause();
+            self.status = Status::SessionRestored(track.title.clone());
+        } else {
+            self.status = Status::Playing { artist: track.artist.clone(), title: track.title.clone() };
+        }
+        self.wave_history.clear();
+        self.load_lyrics();
+        true
+    }
+
+    /// Lyrics for `track_id` arrived; a failure is not worth interrupting the
+    /// music, so it simply means "no lyrics".
+    fn finish_lyrics(&mut self, track_id: String, result: anyhow::Result<Outcome>) -> bool {
+        if self.current_track().is_none_or(|t| t.id != track_id) {
+            return true;
+        }
+        let lyrics = match result {
+            Ok(Outcome::Lyrics(l)) => l,
+            _ => None,
+        };
+        self.lyrics = Some(LyricsView { track_id, lyrics, scroll: -1.0, manual: None });
+        true
     }
 
     fn set_entries(&mut self, kind: ListKind, entries: Vec<Entry>) {
@@ -604,49 +706,40 @@ impl App {
             })
             .collect();
         let Some(id) = self.selected_track().map(|t| t.id.clone()) else { return };
+        if self.net.loading_stream() && self.current_track().is_some_and(|t| t.id == id) {
+            return;
+        }
         let pos = tracks.iter().position(|t| t.id == id);
         self.queue = tracks;
         self.play_at(pos);
     }
 
     fn play_at(&mut self, pos: Option<usize>) {
+        self.net.cancel_playback();
+        self.pending_resume = None;
+        self.pending_quality = None;
+        self.player.stop();
+        self.lyrics = None;
+        self.quality = None;
         self.queue_pos = pos;
         match pos.and_then(|i| self.queue.get(i)).cloned() {
             Some(track) => {
                 // A saved copy plays from disk: instant and offline.
                 let local = self.library.local_stream(&track.id);
                 self.playing_local = local.is_some();
-                let fetched = match local {
-                    Some(s) => Ok(Some(s)),
-                    None => self.service.stream(&track.id, self.quality_pref),
-                };
-                let source = match fetched {
-                    Ok(source) => source,
-                    Err(e) => {
-                        self.player.stop();
-                        self.status = Status::StreamFailed(format!("{e:#}"));
-                        return;
-                    }
-                };
-                self.player.play(&track, source.as_ref().map(|s| s.url.as_str()));
-                // --download-all: keep a copy of everything that gets played.
-                if self.auto_download
-                    && !self.playing_local
-                    && !self.library.is_saved(&track.id)
-                    && let Some(src) = &source
-                {
-                    let _ = self.library.start(&track, src);
+                if let Some(source) = local {
+                    // A saved copy plays at once: no request, no buffering note.
+                    self.finish_stream(track, pos.unwrap_or(0), Ok(Outcome::Stream(Some(source))));
+                    return;
                 }
-                self.set_quality_from(source.as_ref());
-                if self.playing_local
-                    && let Some(q) = self.quality.as_mut()
-                {
-                    q.push_str(" · ");
-                    q.push_str(self.lang.t().from_disk);
-                }
-                self.status = Status::Playing { artist: track.artist.clone(), title: track.title.clone() };
+                // Otherwise the link comes from the worker; the card says
+                // "buffering" until it lands.
+                let position = pos.unwrap_or(0);
+                self.net.post(Job::Stream { track: track.clone(), quality: self.quality_pref, position });
                 self.wave_history.clear();
-                self.load_lyrics();
+                // Nothing fills a list here: the card carries the title and the
+                // footer just needs to say that a stream is on its way.
+                self.status = Status::Loading(ListKind::Overview);
             }
             None => {
                 self.player.stop();
@@ -664,6 +757,7 @@ impl App {
     pub fn toggle_sync(&mut self) {
         if let Some(sync) = self.sync.as_mut() {
             sync.cancel();
+            self.net.cancel_sync();
             self.status = Status::SyncCancelled;
             return;
         }
@@ -671,18 +765,23 @@ impl App {
             self.status = Status::LibraryDisabled;
             return;
         }
-        match self.service.likes_all() {
-            Ok(liked) => {
-                let sync = Sync::new(liked, &self.library);
-                if sync.total == 0 {
-                    self.status = Status::SyncNothing(sync.already);
-                } else {
-                    self.status = Status::SyncStarted { todo: sync.total, already: sync.already };
-                    self.sync = Some(sync);
-                }
-            }
-            Err(e) => self.status = Status::SyncFailed(format!("{e:#}")),
+        if self.net.loading_sync() {
+            self.net.cancel_sync();
+            self.status = Status::SyncCancelled;
+        } else {
+            self.net.post(Job::SyncLikes);
+            self.status = Status::Loading(ListKind::Likes);
         }
+    }
+
+    fn finish_sync_stream(&mut self, track: Track, result: anyhow::Result<Outcome>) -> bool {
+        // Cancelled syncs never start new downloads, even if a link is late.
+        let Some(sync) = self.sync.as_mut() else { return true };
+        match result {
+            Ok(Outcome::Fetched(Some(source))) if self.library.start(&track, &source).is_ok() => {}
+            _ => sync.mark_failed(&track.id),
+        }
+        true
     }
 
     /// Whether a track is in the local library (or flagged cached by the backend).
@@ -733,21 +832,29 @@ impl App {
             self.status = Status::Saving(track.title.clone());
             return;
         }
-        let stream = match self.service.stream(&track.id, self.quality_pref) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
+        // The link comes from the worker; the file is fetched by the library.
+        self.status = Status::Saving(track.title.clone());
+        self.net.post(Job::SaveStream { track, quality: self.quality_pref });
+    }
+
+    /// The link for saving arrived: start the download and report it.
+    fn finish_save_stream(&mut self, track: Track, result: anyhow::Result<Outcome>) -> bool {
+        let source = match result {
+            Ok(Outcome::Fetched(Some(s))) => s,
+            Ok(_) => {
                 self.status = Status::SaveError(self.lang.t().no_audio_to_save.into());
-                return;
+                return true;
             }
             Err(e) => {
                 self.status = Status::SaveError(format!("{e:#}"));
-                return;
+                return true;
             }
         };
-        self.status = match self.library.start(&track, &stream) {
-            Ok(()) => Status::Saving(track.title.clone()),
+        self.status = match self.library.start(&track, &source) {
+            Ok(()) => Status::Saving(track.title),
             Err(e) => Status::SaveError(format!("{e:#}")),
         };
+        true
     }
 
     /// Everything needed to pick up where the listener left off.
@@ -761,7 +868,9 @@ impl App {
             focus: self.focus,
             queue: self.queue.clone(),
             queue_pos: self.queue_pos,
-            position_secs: self.player.position().as_secs_f64(),
+            position_secs: self.pending_resume
+                .filter(|(position, _)| Some(*position) == self.queue_pos)
+                .map_or_else(|| self.player.position().as_secs_f64(), |(_, at)| at.as_secs_f64()),
             mode: self.mode,
             volume: self.volume,
         }
@@ -783,22 +892,24 @@ impl App {
         self.focus = if self.entries.is_empty() { Focus::Nav } else { s.focus };
         self.queue = s.queue;
         let pos = s.queue_pos.filter(|&i| i < self.queue.len());
+        self.queue_pos = pos;
         let Some(i) = pos else { return };
-        self.play_at(Some(i));
-        if self.player.state() == PlayerState::Stopped {
-            return; // stream unavailable: status already explains why
-        }
         let track = self.queue[i].clone();
-        let at = Duration::from_secs_f64(s.position_secs.max(0.0));
-        // Near the very end, start the track over rather than ending at once.
-        if at + Duration::from_secs(3) < track.duration() {
-            self.player.seek(at);
+        let saved_at = if s.position_secs.is_finite() { s.position_secs.max(0.0) } else { 0.0 };
+        let at = Duration::from_secs_f64(saved_at.min(track.duration().as_secs_f64()));
+        let at = if at + Duration::from_secs(3) < track.duration() { at } else { Duration::ZERO };
+        self.net.cancel_playback();
+        self.player.stop();
+        self.pending_quality = None;
+        self.pending_resume = Some((i, at));
+        self.playing_local = false;
+        if let Some(source) = self.library.local_stream(&track.id) {
+            self.playing_local = true;
+            self.finish_stream(track, i, Ok(Outcome::Stream(Some(source))));
+        } else {
+            self.net.post(Job::Stream { track, quality: self.quality_pref, position: i });
+            self.status = Status::Loading(ListKind::Overview);
         }
-        self.player.toggle_pause();
-        if let Some(view) = self.lyrics.as_mut() {
-            view.scroll = -1.0;
-        }
-        self.status = Status::SessionRestored(track.title);
     }
 
     /// Switch to the next quality tier and, if a real stream is playing,
@@ -811,8 +922,21 @@ impl App {
             return; // nothing streaming: applies to the next track
         }
         let (pos, paused) = (self.player.position(), self.player.state() == PlayerState::Paused);
-        match self.service.stream(&track.id, self.quality_pref) {
-            Ok(Some(src)) => {
+        // Remember where we were, so the new stream resumes in place.
+        self.pending_quality = Some((track.id.clone(), pos, paused));
+        self.net.post(Job::QualityStream { track, quality: self.quality_pref });
+    }
+
+    /// The stream in the new tier arrived: swap it in without losing the spot.
+    fn finish_quality_stream(&mut self, track: Track, result: anyhow::Result<Outcome>) -> bool {
+        let Some((id, _pos, _paused)) = self.pending_quality.take() else { return true };
+        if id != track.id || self.current_track().is_none_or(|t| t.id != track.id) {
+            return true; // the user moved on while this was in flight
+        }
+        match result {
+            Ok(Outcome::Fetched(Some(src))) => {
+                let pos = self.player.position();
+                let paused = self.player.state() == PlayerState::Paused;
                 self.player.play(&track, Some(&src.url));
                 self.player.seek(pos);
                 if paused {
@@ -820,9 +944,10 @@ impl App {
                 }
                 self.set_quality_from(Some(&src));
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(e) => self.status = Status::StreamFailed(format!("{e:#}")),
         }
+        true
     }
 
     fn seek_by(&mut self, secs: i64) {
@@ -867,13 +992,19 @@ impl App {
             self.status = Status::NothingToLike;
             return;
         };
+        if self.net.liking(&track.id) { return; }
         let liked = !track.liked;
-        if let Err(e) = self.service.set_liked(&track.id, liked) {
-            self.status = Status::LikeFailed(format!("{e:#}"));
-            return;
-        }
+        // Flip the mark now and reconcile when the answer lands: a like is a
+        // small action and waiting for the network would make it feel broken.
+        self.apply_like(&track.id, liked);
+        self.status = if liked { Status::Liked(track.title) } else { Status::Unliked(track.title) };
+        self.net.post(Job::Like { track_id: track.id, liked });
+    }
+
+    /// Sets the like mark everywhere the track appears (queue and any list).
+    fn apply_like(&mut self, track_id: &str, liked: bool) {
         let update = |t: &mut Track| {
-            if t.id == track.id {
+            if t.id == track_id {
                 t.liked = liked;
             }
         };
@@ -883,7 +1014,16 @@ impl App {
                 update(t);
             }
         });
-        self.status = if liked { Status::Liked(track.title) } else { Status::Unliked(track.title) };
+    }
+
+    /// The like request came back: on failure, put the mark back as it was and
+    /// say why, so the screen never claims something the server refused.
+    fn finish_like(&mut self, track_id: String, liked: bool, result: anyhow::Result<Outcome>) -> bool {
+        if let Err(e) = result {
+            self.apply_like(&track_id, !liked);
+            self.status = Status::LikeFailed(format!("{e:#}"));
+        }
+        true
     }
 
     /// `s`: popular tracks of the playing (or selected) track's artist;
@@ -896,9 +1036,7 @@ impl App {
             self.status = Status::ArtistNeedTrack;
             return;
         };
-        let r = self.service.artist_tracks(&track, all);
-        let name = track.artist.split(", ").next().unwrap_or(&track.artist).to_string();
-        self.show_tracks(if all { ListKind::ArtistAll(name) } else { ListKind::Artist(name) }, r);
+        self.await_job(Job::Artist { track, all });
     }
 
     fn load_lyrics(&mut self) {
@@ -906,10 +1044,8 @@ impl App {
         if self.lyrics.as_ref().is_some_and(|l| l.track_id == track.id) {
             return;
         }
-        let id = track.id.clone();
-        // A lyrics failure must never interrupt playback: treat it as "no lyrics".
-        let lyrics = self.service.lyrics(&id).ok().flatten();
-        self.lyrics = Some(LyricsView { track_id: id, lyrics, scroll: -1.0, manual: None });
+        let track_id = track.id.clone();
+        self.net.post(Job::Lyrics { track_id });
     }
 
     /// Line the lyric view follows (before manual offset): the sung line, or
@@ -946,7 +1082,7 @@ impl App {
     }
 
     pub fn tick(&mut self) {
-        self.collect_job();
+        while self.collect_job() {}
         if self.player.finished() {
             self.advance(false);
         }
@@ -961,7 +1097,10 @@ impl App {
             };
         }
         if let Some(sync) = self.sync.as_mut() {
-            sync.pump(&mut self.library, self.service.as_ref(), self.quality_pref);
+            let slots = sync.free_slots(&self.library);
+            for track in sync.next_batch(&self.library, slots) {
+                self.net.post(Job::SyncStream { track, quality: self.quality_pref });
+            }
             if sync.is_done() {
                 self.status = Status::SyncDone { saved: sync.saved, failed: sync.failed };
                 self.sync = None;
@@ -1054,6 +1193,7 @@ mod tests {
             app.tick();
         }
         app.tick();
+        assert!(!app.net.is_busy(), "worker did not finish before the deadline");
     }
 
     fn type_str(app: &mut App, s: &str) {
@@ -1108,6 +1248,93 @@ mod tests {
     }
 
     #[test]
+    fn home_cancels_a_pending_list() {
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        gate.hold();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press(&mut a, KeyCode::Char('w'));
+        a.open_section(Section::Home);
+        gate.release();
+        settle(&mut a);
+        assert_eq!(a.list, ListKind::Overview);
+        assert_eq!(a.status, Status::Home);
+        assert!(a.entries.is_empty());
+    }
+
+    #[test]
+    fn navigating_during_stream_loading_does_not_discard_the_stream() {
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('w'));
+        gate.hold();
+        press(&mut a, KeyCode::Enter);
+        let id = a.current_track().unwrap().id.clone();
+        assert!(a.net.loading_stream());
+        assert_eq!(a.player.state(), PlayerState::Stopped);
+        press(&mut a, KeyCode::Enter); // repeated activation must not replace the pending stream
+        press(&mut a, KeyCode::Char('l'));
+        gate.release();
+        settle(&mut a);
+        assert_eq!(a.current_track().unwrap().id, id);
+        assert_eq!(a.player.state(), PlayerState::Playing);
+        assert_eq!(a.list, ListKind::Likes);
+        assert_eq!(a.lyrics.as_ref().unwrap().track_id, id);
+    }
+
+    #[test]
+    fn a_failed_like_rolls_back_even_when_a_list_is_requested() {
+        let fake = FakeService::parked().reject_likes();
+        let gate = fake.gate();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Enter);
+        let id = a.current_track().unwrap().id.clone();
+        let was = a.current_track().unwrap().liked;
+        gate.hold();
+        press(&mut a, KeyCode::Char('L'));
+        assert_eq!(a.current_track().unwrap().liked, !was, "immediate optimistic response");
+        press(&mut a, KeyCode::Char('p'));
+        gate.release();
+        settle(&mut a);
+        assert_eq!(a.current_track().unwrap().liked, was, "failure must still be delivered");
+        assert_eq!(a.current_track().unwrap().id, id);
+        assert_eq!(a.list, ListKind::Playlists);
+    }
+
+    #[test]
+    fn restored_zero_and_near_end_positions_stay_paused() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Enter);
+        let mut saved = a.snapshot();
+        for position in [0.0, a.current_track().unwrap().duration_secs as f64 - 1.0] {
+            saved.position_secs = position;
+            let mut b = app();
+            b.restore(serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap());
+            settle(&mut b);
+            assert_eq!(b.player.state(), PlayerState::Paused);
+            assert_eq!(b.player.position().as_secs(), 0);
+        }
+    }
+
+    #[test]
+    fn restored_pause_is_applied_before_requesting_lyrics() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Enter);
+        let saved = a.snapshot();
+        let mut b = app();
+        b.queue = saved.queue.clone();
+        b.queue_pos = saved.queue_pos;
+        b.pending_resume = Some((saved.queue_pos.unwrap(), Duration::from_secs(42)));
+        b.finish_stream(b.current_track().unwrap().clone(), saved.queue_pos.unwrap(), Ok(Outcome::Stream(None)));
+        assert_eq!(b.player.state(), PlayerState::Paused);
+        assert_eq!(b.player.position().as_secs(), 42);
+    }
+
+    #[test]
     fn next_index_modes() {
         let mut rng = Rng::seeded(42);
         assert_eq!(next_index(PlaybackMode::All, 3, 2, false, &mut rng), Some(0));
@@ -1153,7 +1380,7 @@ mod tests {
         let mut a = app();
         press_wait(&mut a, KeyCode::Char('ц')); // w
         assert_eq!(a.list, ListKind::Wave);
-        press(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Enter);
         assert_eq!(a.player.state(), PlayerState::Playing);
         press(&mut a, KeyCode::Char('т')); // n
         assert_eq!(a.queue_pos, Some(1));
@@ -1193,7 +1420,7 @@ mod tests {
         let mut a = app();
         press_wait(&mut a, KeyCode::Char('w'));
         press(&mut a, KeyCode::Char('j'));
-        press(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Enter);
         assert_eq!(a.queue_pos, Some(1));
         assert_eq!(a.player.state(), PlayerState::Playing);
 
@@ -1202,6 +1429,7 @@ mod tests {
         press(&mut a, KeyCode::Char('b'));
         press(&mut a, KeyCode::Char('b'));
         assert_eq!(a.queue_pos, Some(0));
+        settle(&mut a);
 
         press(&mut a, KeyCode::Char(' '));
         assert_eq!(a.player.state(), PlayerState::Paused);
@@ -1210,6 +1438,7 @@ mod tests {
         let was = a.current_track().unwrap().liked;
         press(&mut a, KeyCode::Char('L'));
         assert_eq!(a.current_track().unwrap().liked, !was);
+        settle(&mut a);
         assert_eq!(a.service.likes().unwrap().iter().any(|t| t.id == id), !was);
     }
 
@@ -1220,14 +1449,14 @@ mod tests {
         assert!(matches!(a.entries[0], Entry::Playlist(_)));
         press_wait(&mut a, KeyCode::Enter);
         assert_eq!(a.list, ListKind::Playlist("Ночной город".into()));
-        press(&mut a, KeyCode::Enter);
-        press(&mut a, KeyCode::Char('s'));
+        press_wait(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Char('s'));
         assert_eq!(a.list, ListKind::Artist("Neon Harbor".into()));
-        press(&mut a, KeyCode::Char('S'));
+        press_wait(&mut a, KeyCode::Char('S'));
         assert_eq!(a.list, ListKind::ArtistAll("Neon Harbor".into()));
-        press(&mut a, KeyCode::Char('Ы')); // Shift+S in the Russian layout
+        press_wait(&mut a, KeyCode::Char('Ы')); // Shift+S in the Russian layout
         assert_eq!(a.list, ListKind::ArtistAll("Neon Harbor".into()));
-        press(&mut a, KeyCode::Char('s'));
+        press_wait(&mut a, KeyCode::Char('s'));
         assert_eq!(a.list, ListKind::Artist("Neon Harbor".into()));
         assert_eq!(a.entries.len(), 3);
     }
@@ -1236,7 +1465,7 @@ mod tests {
     fn lyrics_load_follow_and_scroll() {
         let mut a = app();
         press_wait(&mut a, KeyCode::Char('w')); // first wave track is "Static Bloom", which has LRC
-        press(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Enter);
         let view = a.lyrics.as_ref().unwrap();
         assert_eq!(view.track_id, "2");
         assert!(view.lyrics.as_ref().unwrap().synced);
@@ -1267,7 +1496,7 @@ mod tests {
         let mut a = app();
         press_wait(&mut a, KeyCode::Char('w'));
         press(&mut a, KeyCode::Char('j')); // "Low Tide" has no lyrics
-        press(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Enter);
         assert!(a.lyrics.as_ref().unwrap().lyrics.is_none());
         assert_eq!(a.lyric_line(), None);
         press(&mut a, KeyCode::Char(']')); // harmless
@@ -1280,7 +1509,7 @@ mod tests {
         press_wait(&mut a, KeyCode::Char('p'));
         press_wait(&mut a, KeyCode::Enter); // open "Ночной город"
         press(&mut a, KeyCode::Char('j'));
-        press(&mut a, KeyCode::Enter); // play its 2nd track
+        press_wait(&mut a, KeyCode::Enter); // play its 2nd track
         press(&mut a, KeyCode::Char('r'));
         press(&mut a, KeyCode::Char('-'));
         a.player.seek(Duration::from_secs(42));
@@ -1289,6 +1518,7 @@ mod tests {
 
         let mut b = app();
         b.restore(serde_json::from_str(&json).unwrap());
+        settle(&mut b); // the stream arrives off-thread
         assert_eq!(b.list, ListKind::Playlist("Ночной город".into()));
         assert_eq!(b.entries.len(), 3);
         assert_eq!(b.selected, 1);
@@ -1339,7 +1569,7 @@ mod tests {
         assert_eq!(a.status, Status::LibraryDisabled);
         let dir = std::env::temp_dir().join(format!("yamusiq-app-lib-{}", std::process::id()));
         a.library = Library::open(dir.clone());
-        press(&mut a, KeyCode::Char('В')); // Shift+D in the Russian layout
+        press_wait(&mut a, KeyCode::Char('В')); // Shift+D in the Russian layout
         assert!(matches!(a.status, Status::SaveError(_)), "fake tracks have no audio to save");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1352,6 +1582,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yamusiq-sync-{}", std::process::id()));
         a.library = Library::open(dir.clone());
         press(&mut a, KeyCode::Char('Î')); // Option+Shift+D without Meta
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while a.net.loading_sync() && Instant::now() < deadline {
+            std::thread::yield_now();
+            a.collect_job();
+        }
         assert!(matches!(a.status, Status::SyncStarted { .. }));
         assert!(a.sync.is_some());
         press(&mut a, KeyCode::Char('Î'));
