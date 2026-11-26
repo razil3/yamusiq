@@ -7,3 +7,6 @@ target/
 .claude/settings.local.json
 # Release archives built by scripts/dist.sh; they belong in a GitHub release.
 dist/
+
+# Local project instructions.
+/CLAUDE.md
