@@ -11,6 +11,8 @@ use crate::sync::Sync;
 use crate::model::{Lyrics, Playlist, Quality, Track};
 use crate::player::{Player, PlayerState};
 use crate::net::{Job, Outcome, Worker};
+use crate::radio::{self, EventKind};
+use crate::likes;
 use crate::service::MusicService;
 
 /// The one palette: graphite field, light-grey copy, thin dim line-work and
@@ -95,6 +97,7 @@ pub enum ListKind {
     Cached,
     Playlists,
     Search(String),
+    TrackWave(String),
     Playlist(String),
     Artist(String),
     ArtistAll(String),
@@ -106,6 +109,7 @@ impl ListKind {
         match self {
             Self::Overview => t.list_overview.into(),
             Self::Wave => t.list_wave.into(),
+            Self::TrackWave(id) => fill(t.list_track_wave, &[id]),
             Self::Likes => t.list_likes.into(),
             Self::Cached => t.list_cached.into(),
             Self::Playlists => t.list_playlists.into(),
@@ -122,6 +126,10 @@ impl ListKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Ready,
+    LinkCopied,
+    LinkFailed(String),
+    RadioFailed(String),
+    NeedTrack,
     SearchOpen,
     SearchCancelled,
     Mode(PlaybackMode),
@@ -166,6 +174,10 @@ impl Status {
         let t = lang.t();
         match self {
             Self::Ready => t.st_ready.into(),
+            Self::LinkCopied => t.st_link_copied.into(),
+            Self::LinkFailed(e) => fill(t.st_link_failed, &[e]),
+            Self::RadioFailed(e) => fill(t.st_radio_failed, &[e]),
+            Self::NeedTrack => t.st_need_track.into(),
             Self::SearchOpen => t.st_search_open.into(),
             Self::SearchCancelled => t.st_search_cancelled.into(),
             Self::Mode(m) => fill(t.st_mode, &[m.label(lang)]),
@@ -232,7 +244,8 @@ impl Rng {
 fn job_kind(job: &Job) -> ListKind {
     match job {
         Job::Wave => ListKind::Wave,
-        Job::Likes => ListKind::Likes,
+        Job::TrackWave { title, .. } => ListKind::TrackWave(title.clone()),
+        Job::Likes | Job::LikesMore { .. } => ListKind::Likes,
         Job::Cached => ListKind::Cached,
         Job::Playlists => ListKind::Playlists,
         Job::PlaylistTracks { title, .. } => ListKind::Playlist(title.clone()),
@@ -242,7 +255,8 @@ fn job_kind(job: &Job) -> ListKind {
             if *all { ListKind::ArtistAll(name) } else { ListKind::Artist(name) }
         }
         // These do not fill a list; the status line describes them itself.
-        Job::SyncLikes
+        Job::RadioMore { .. } | Job::RadioNext { .. } | Job::Feedback { .. } | Job::OpenTrack { .. } | Job::CopyLink { .. }
+        | Job::SyncLikes
         | Job::Stream { .. }
         | Job::Lyrics { .. }
         | Job::Like { .. }
@@ -289,6 +303,18 @@ pub struct LyricsView {
     pub manual: Option<(f64, Instant)>,
 }
 
+pub struct LinkDialog {
+    pub input: String,
+    pub error: Option<String>,
+    pub loading: bool,
+}
+
+struct LikesParent {
+    entries: Vec<Entry>,
+    selected: usize,
+    cursor: Option<likes::Cursor>,
+}
+
 pub struct App {
     pub should_quit: bool,
     pub lang: Lang,
@@ -300,10 +326,33 @@ pub struct App {
     pub section: usize,
     /// `Some` while the search prompt is open.
     pub query: Option<String>,
+    pub link_dialog: Option<LinkDialog>,
+    likes_list: Option<likes::Cursor>,
+    likes_queue: Option<likes::Cursor>,
+    next_likes_id: u64,
+    likes_retry: std::collections::HashMap<u64, Instant>,
+    likes_waiting: bool,
+    likes_wait_manual: bool,
+    radio_list: Option<radio::Session>,
+    radio_list_view: u64,
+    radio_initial_target: usize,
+    radio_list_retry_at: Instant,
+    radio: Option<radio::Session>,
+    radio_generation: u64,
+    radio_view_generation: Option<u64>,
+    radio_waiting: bool,
+    radio_cursor: Option<String>,
+    radio_retry_at: Instant,
+    radio_started_track: bool,
+    radio_announced: bool,
+    radio_heard: Duration,
+    radio_since: Option<Instant>,
+    feedback_sequence: u64,
     pub list: ListKind,
     pub entries: Vec<Entry>,
     pub selected: usize,
     playlist_parent: Option<(Vec<Entry>, usize)>,
+    artist_likes_parent: Option<LikesParent>,
     playlist_return_title: Option<String>,
     pub queue: Vec<Track>,
     pub queue_pos: Option<usize>,
@@ -333,6 +382,9 @@ pub struct App {
     pending_remove: Option<(String, Instant)>,
     /// Where to seek and pause once a restored track's stream arrives.
     pending_resume: Option<(usize, Duration)>,
+    /// Space can request playback before the restored stream has arrived.
+    restore_should_play: bool,
+    play_requested_at: Option<Instant>,
     /// Track, position and pause state to restore after a quality switch.
     pending_quality: Option<(String, Duration, bool)>,
     /// Favourites sync in progress (⌥⇧D / --download-fav).
@@ -366,10 +418,33 @@ impl App {
             focus: Focus::Nav,
             section: 0,
             query: None,
+            link_dialog: None,
+            likes_list: None,
+            likes_queue: None,
+            next_likes_id: 1,
+            likes_retry: std::collections::HashMap::new(),
+            likes_waiting: false,
+            likes_wait_manual: false,
+            radio_list: None,
+            radio_list_view: 0,
+            radio_initial_target: 0,
+            radio_list_retry_at: Instant::now(),
+            radio: None,
+            radio_generation: 0,
+            radio_view_generation: None,
+            radio_waiting: false,
+            radio_cursor: None,
+            radio_retry_at: Instant::now(),
+            radio_started_track: false,
+            radio_announced: false,
+            radio_heard: Duration::ZERO,
+            radio_since: None,
+            feedback_sequence: 0,
             list: ListKind::Overview,
             entries: Vec::new(),
             selected: 0,
             playlist_parent: None,
+            artist_likes_parent: None,
             playlist_return_title: None,
             queue: Vec::new(),
             queue_pos: None,
@@ -387,6 +462,8 @@ impl App {
             library: Library::disabled(),
             pending_remove: None,
             pending_resume: None,
+            restore_should_play: false,
+            play_requested_at: None,
             pending_quality: None,
             sync: None,
             auto_download: false,
@@ -416,11 +493,15 @@ impl App {
             return;
         }
         let code = match key.code {
-            KeyCode::Char(c) if self.query.is_none() => KeyCode::Char(latin_key(c)),
+            KeyCode::Char(c) if self.query.is_none() && self.link_dialog.is_none() => KeyCode::Char(latin_key(c)),
             other => other,
         };
         if key.modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
             self.should_quit = true;
+            return;
+        }
+        if self.link_dialog.is_some() {
+            self.on_link_key(code);
             return;
         }
         // ⌥⇧D: with "Option as Meta" it arrives as Alt+D; without, macOS
@@ -462,7 +543,7 @@ impl App {
                 self.status = Status::Lyrics(self.show_lyrics);
             }
             KeyCode::Char('o') => self.cycle_quality(),
-            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => self.back_to_playlists(),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => self.back_to_parent(),
             KeyCode::Left => self.seek_by(-5),
             KeyCode::Right => self.seek_by(5),
             KeyCode::Char('[') => self.scroll_lyrics(-1.0),
@@ -492,11 +573,74 @@ impl App {
             }
             KeyCode::Char('p') => self.open_section(Section::Playlists),
             KeyCode::Char('w') => self.open_section(Section::Wave),
+            KeyCode::Char('W') => {
+                if let Some(track) = self.action_track().cloned() {
+                    self.await_job(Job::TrackWave { title: format!("{} — {}", track.artist, track.title), track_id: track.id });
+                } else { self.status = Status::NeedTrack; }
+            }
+            KeyCode::Char('u') => self.copy_track_link(),
+            KeyCode::Char('O') => {
+                self.link_dialog = Some(LinkDialog { input: String::new(), error: None, loading: false });
+            }
             KeyCode::Char('d') => self.open_section(Section::Cached),
             KeyCode::Char('l') => self.open_section(Section::Likes),
             KeyCode::Char('s') => self.artist_search(false),
             KeyCode::Char('S') => self.artist_search(true),
             _ => {}
+        }
+    }
+
+    /// List actions refer to the highlighted track, not an unrelated playing one.
+    fn action_track(&self) -> Option<&Track> {
+        if self.focus == Focus::List { self.selected_track().or_else(|| self.current_track()) }
+        else { self.current_track().or_else(|| self.selected_track()) }
+    }
+
+    fn copy_track_link(&mut self) {
+        let Some(track) = self.action_track() else { self.status = Status::NeedTrack; return };
+        match crate::links::track_url(track) {
+            Ok(url) => { self.net.post(Job::CopyLink { url }); }
+            Err(e) => self.status = Status::LinkFailed(e.to_string()),
+        }
+    }
+
+    fn on_link_key(&mut self, code: KeyCode) {
+        if code == KeyCode::Esc {
+            self.net.cancel_open();
+            self.link_dialog = None;
+            return;
+        }
+        let Some(dialog) = self.link_dialog.as_mut() else { return };
+        match code {
+            KeyCode::Enter if !dialog.loading => {
+                match crate::links::track_id(&dialog.input) {
+                    Ok(id) => {
+                        dialog.loading = true;
+                        dialog.error = None;
+                        self.net.post(Job::OpenTrack { id });
+                    }
+                    Err(_) => dialog.error = Some(self.lang.t().link_invalid.into()),
+                }
+            }
+            KeyCode::Backspace | KeyCode::Char(_) => {
+                self.net.cancel_open();
+                dialog.loading = false;
+                dialog.error = None;
+                match code {
+                    KeyCode::Backspace => { dialog.input.pop(); }
+                    KeyCode::Char(c) if !c.is_control() && dialog.input.len() < 2048 => dialog.input.push(c),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn on_paste(&mut self, text: &str) {
+        if self.link_dialog.is_none() && self.query.is_none() { return; }
+        for c in text.chars().filter(|c| !c.is_control()).take(2048) {
+            if self.link_dialog.is_some() { self.on_link_key(KeyCode::Char(c)); }
+            else if let Some(query) = self.query.as_mut() { query.push(c); }
         }
     }
 
@@ -538,6 +682,13 @@ impl App {
             return;
         }
         *cursor = cursor.saturating_add_signed(delta).min(len - 1);
+        if self.focus == Focus::List && self.list == ListKind::Likes
+            && self.selected.saturating_add(likes::PREFETCH + 1) >= self.entries.len()
+            && let Some(cursor) = self.likes_list.clone()
+        { self.request_likes_page(cursor); }
+        if self.focus == Focus::List && self.selected >= self.entries.len().saturating_sub(2) {
+            self.request_radio_list_more();
+        }
     }
 
     fn activate(&mut self) {
@@ -552,6 +703,23 @@ impl App {
                 None => {}
             },
         }
+    }
+
+    pub fn can_back_to_likes(&self) -> bool {
+        self.artist_likes_parent.is_some()
+    }
+
+    fn back_to_parent(&mut self) {
+        if let Some(parent) = self.artist_likes_parent.take() {
+            self.net.cancel_list();
+            self.set_entries(ListKind::Likes, parent.entries);
+            self.likes_list = parent.cursor;
+            self.selected = parent.selected.min(self.entries.len().saturating_sub(1));
+            self.section = Section::ALL.iter().position(|s| *s == Section::Likes).unwrap();
+            self.status = Status::Loaded(ListKind::Likes, self.entries.len());
+            return;
+        }
+        self.back_to_playlists();
     }
 
     fn back_to_playlists(&mut self) {
@@ -612,6 +780,47 @@ impl App {
         if let Job::Like { track_id, liked } = &done.job {
             return self.finish_like(track_id.clone(), *liked, done.result);
         }
+        if let Job::LikesMore { cursor } = &done.job {
+            self.finish_likes_page(cursor, done.result);
+            return true;
+        }
+        if let Job::RadioMore { view, .. } = &done.job {
+            if *view == self.radio_list_view { self.finish_radio_list_more(done.result); }
+            return true;
+        }
+        if let Job::RadioNext { generation, .. } = &done.job {
+            if *generation == self.radio_generation { self.finish_radio_next(done.result); }
+            return true;
+        }
+        if matches!(done.job, Job::Feedback { .. }) {
+            if let Err(e) = done.result { self.status = Status::RadioFailed(e.to_string()); }
+            return true;
+        }
+        if matches!(done.job, Job::CopyLink { .. }) {
+            self.status = match done.result {
+                Ok(_) => Status::LinkCopied,
+                Err(e) => Status::LinkFailed(e.to_string()),
+            };
+            return true;
+        }
+        if matches!(done.job, Job::OpenTrack { .. }) {
+            if self.link_dialog.is_none() { return true; }
+            match done.result {
+                Ok(Outcome::Track(Some(track))) => {
+                    self.link_dialog = None;
+                    self.net.cancel_list();
+                    self.end_radio_track(EventKind::Skip);
+                    self.detach_radio();
+                    self.set_entries(ListKind::Search(track.title.clone()), vec![Entry::Track(track)]);
+                    self.play_from_list();
+                }
+                result => {
+                    let error = match result { Err(e) => e.to_string(), _ => self.lang.t().link_not_found.into() };
+                    if let Some(dialog) = self.link_dialog.as_mut() { dialog.loading = false; dialog.error = Some(error); }
+                }
+            }
+            return true;
+        }
         if let Job::SaveStream { track, .. } = &done.job {
             return self.finish_save_stream(track.clone(), done.result);
         }
@@ -639,6 +848,27 @@ impl App {
         }
         let kind = job_kind(&done.job);
         match done.result {
+            Ok(Outcome::LikesPage(page)) => {
+                let Some(refs) = page.refs else { return true };
+                let count = page.tracks.len();
+                let cursor = likes::Cursor { id: self.next_likes_id, refs, next: page.next };
+                self.next_likes_id = self.next_likes_id.wrapping_add(1);
+                self.set_entries(ListKind::Likes, page.tracks.into_iter().map(Entry::Track).collect());
+                self.likes_list = Some(cursor);
+                self.status = Status::Loaded(ListKind::Likes, count);
+            }
+            Ok(Outcome::RadioWindow(window)) => {
+                let count = window.tracks.len();
+                let context = radio::Session { station: window.station, batch_ids: window.batch_ids };
+                self.set_entries(kind.clone(), window.tracks.into_iter().map(Entry::Track).collect());
+                self.radio_list = Some(context);
+                self.radio_initial_target = if count > 0 { radio::INITIAL_TRACKS } else { 0 };
+                self.status = Status::Loaded(kind, count);
+                if matches!(done.job, Job::TrackWave { .. }) {
+                    self.section = Section::ALL.iter().position(|s| *s == Section::Wave).unwrap();
+                    if count > 0 { self.play_from_list(); }
+                }
+            }
             Ok(Outcome::Tracks(tracks)) => {
                 // "Cached" mixes the local library with what the backend keeps.
                 let tracks = if matches!(done.job, Job::Cached) {
@@ -657,7 +887,7 @@ impl App {
                 self.set_entries(kind, ps.into_iter().map(Entry::Playlist).collect());
                 if let Some(selected) = selected { self.selected = selected; }
             }
-            Ok(Outcome::Stream(_) | Outcome::Lyrics(_) | Outcome::Liked | Outcome::Fetched(_)) => {}
+            Ok(Outcome::Stream(_) | Outcome::Lyrics(_) | Outcome::Liked | Outcome::Fetched(_) | Outcome::Track(_) | Outcome::Ack | Outcome::Radio(_)) => {}
             Err(e) => self.status = Status::Failed(kind, format!("{e:#}")),
         }
         true
@@ -699,11 +929,18 @@ impl App {
             && at_pos == position
         {
             self.player.seek(at);
-            self.player.toggle_pause();
-            self.status = Status::SessionRestored(track.title.clone());
+            if self.restore_should_play {
+                self.status = Status::Playing { artist: track.artist.clone(), title: track.title.clone() };
+            } else {
+                self.player.toggle_pause();
+                self.status = Status::SessionRestored(track.title.clone());
+            }
+            self.restore_should_play = false;
         } else {
             self.status = Status::Playing { artist: track.artist.clone(), title: track.title.clone() };
         }
+        if let Some(started) = self.play_requested_at.take() { crate::timing::record("playback.ready", started.elapsed()); }
+        if self.player.state() == PlayerState::Playing { self.begin_radio_track(); }
         self.wave_history.clear();
         self.load_lyrics();
         true
@@ -724,7 +961,18 @@ impl App {
     }
 
     fn set_entries(&mut self, kind: ListKind, entries: Vec<Entry>) {
+        if !matches!(kind, ListKind::Artist(_) | ListKind::ArtistAll(_)) {
+            self.artist_likes_parent = None;
+        }
         self.list = kind;
+        self.likes_list = None;
+        self.retain_likes_pages();
+        self.radio_list_view = self.radio_list_view.wrapping_add(1);
+        self.radio_initial_target = 0;
+        self.radio_list_retry_at = Instant::now();
+        self.net.cancel_radio_more();
+        self.radio_list = None;
+        self.radio_view_generation = None;
         self.entries = entries;
         self.selected = 0;
         self.focus = if self.entries.is_empty() { Focus::Nav } else { Focus::List };
@@ -744,13 +992,29 @@ impl App {
             return;
         }
         let pos = tracks.iter().position(|t| t.id == id);
+        self.end_radio_track(EventKind::Skip);
+        self.detach_radio();
+        if matches!(self.list, ListKind::Wave | ListKind::TrackWave(_)) {
+            self.radio = self.radio_list.clone();
+            self.radio_view_generation = Some(self.radio_generation);
+        }
+        self.likes_queue = if self.list == ListKind::Likes { self.likes_list.clone() } else { None };
+        self.likes_waiting = false;
+        self.retain_likes_pages();
         self.queue = tracks;
         self.play_at(pos);
     }
 
     fn play_at(&mut self, pos: Option<usize>) {
+        self.play_requested_at = Some(Instant::now());
+        self.likes_waiting = false;
+        self.end_radio_track(EventKind::Skip);
+        self.radio_heard = Duration::ZERO;
+        self.radio_since = None;
+        self.radio_waiting = false;
         self.net.cancel_playback();
         self.pending_resume = None;
+        self.restore_should_play = false;
         self.pending_quality = None;
         self.player.stop();
         self.lyrics = None;
@@ -906,6 +1170,10 @@ impl App {
             position_secs: self.pending_resume
                 .filter(|(position, _)| Some(*position) == self.queue_pos)
                 .map_or_else(|| self.player.position().as_secs_f64(), |(_, at)| at.as_secs_f64()),
+            radio: self.radio.clone(),
+            radio_list: self.radio_list.clone(),
+            likes_list: self.likes_list.clone(),
+            likes_queue: self.likes_queue.clone(),
             mode: self.mode,
             volume: self.volume,
         }
@@ -927,13 +1195,22 @@ impl App {
         self.section = s.section.min(Section::ALL.len() - 1);
         self.focus = if self.entries.is_empty() { Focus::Nav } else { s.focus };
         self.queue = s.queue;
+        self.likes_list = s.likes_list.filter(|c| self.list == ListKind::Likes && c.valid() && c.next >= self.entries.len());
+        self.likes_queue = s.likes_queue.filter(|c| c.valid() && c.next >= self.queue.len());
+        self.next_likes_id = self.likes_list.iter().chain(self.likes_queue.iter()).map(|c| c.id).max().unwrap_or(0).wrapping_add(1);
+        self.radio = s.radio.filter(|r| r.batch_ids.len() == self.queue.len());
+        self.radio_list = s.radio_list.filter(|r| r.batch_ids.len() == self.entries.len());
+        if self.radio.is_some() && self.radio == self.radio_list { self.radio_view_generation = Some(self.radio_generation); }
         let pos = s.queue_pos.filter(|&i| i < self.queue.len());
         self.queue_pos = pos;
         // Sessions written by older versions may contain only the first 300
         // favourites. Keep them visible until the full list arrives, but leave
         // the playback queue intact so restoring does not change the track.
-        if self.list == ListKind::Likes {
+        if self.list == ListKind::Likes && self.likes_list.is_none() {
             self.await_job(Job::Likes);
+        }
+        if self.radio_list.is_none() && self.list == ListKind::Wave {
+            self.await_job(Job::Wave);
         }
         let Some(i) = pos else { return };
         let track = self.queue[i].clone();
@@ -943,7 +1220,9 @@ impl App {
         self.net.cancel_playback();
         self.player.stop();
         self.pending_quality = None;
+        self.play_requested_at = Some(Instant::now());
         self.pending_resume = Some((i, at));
+        self.restore_should_play = false;
         self.playing_local = false;
         if let Some(source) = self.library.local_stream(&track.id) {
             self.playing_local = true;
@@ -1005,13 +1284,29 @@ impl App {
     }
 
     fn toggle_pause(&mut self) {
+        if self.likes_waiting { return; }
+        if self.pending_resume.is_some() && self.net.loading_stream() {
+            // The saved queue/position are already restored, but there is no
+            // playable source yet. Do not restart the highlighted list row.
+            self.restore_should_play = !self.restore_should_play;
+            return;
+        }
+        if self.player.state() == PlayerState::Stopped && self.net.loading_stream() {
+            return; // a normal track request is pending; preserve that queue too
+        }
         if self.player.state() == PlayerState::Stopped {
             if self.selected_track().is_some() {
                 self.play_from_list();
             }
             return;
         }
+        self.update_radio_clock();
         self.player.toggle_pause();
+        self.radio_since = None;
+        if self.player.state() == PlayerState::Playing {
+            if !self.radio_started_track { self.begin_radio_track(); }
+            else { self.radio_since = Some(Instant::now()); }
+        }
         self.status = match self.player.state() {
             PlayerState::Paused => Status::Paused,
             _ => Status::Resumed,
@@ -1020,8 +1315,30 @@ impl App {
 
     fn advance(&mut self, manual: bool) {
         let Some(cur) = self.queue_pos else { return };
-        let next = next_index(self.mode, self.queue.len(), cur, manual, &mut self.rng);
-        self.play_at(next);
+        self.end_radio_track(if manual { EventKind::Skip } else { EventKind::TrackFinished });
+        if cur + 1 >= self.queue.len() && (manual || self.mode != PlaybackMode::Repeat)
+            && let Some(cursor) = self.likes_queue.clone().filter(|c| c.has_more())
+        {
+            self.player.stop();
+            self.likes_waiting = true;
+            self.likes_wait_manual = manual;
+            self.status = Status::Loading(ListKind::Likes);
+            self.request_likes_page(cursor);
+            return;
+        }
+        if self.radio.is_some() {
+            if !manual && self.mode == PlaybackMode::Repeat { self.play_at(Some(cur)); }
+            else if cur + 1 < self.queue.len() { self.play_at(Some(cur + 1)); }
+            else {
+                self.player.stop();
+                self.radio_waiting = true;
+                self.status = Status::Loading(ListKind::Wave);
+                self.request_radio_next();
+            }
+        } else {
+            let next = next_index(self.mode, self.queue.len(), cur, manual, &mut self.rng);
+            self.play_at(next);
+        }
     }
 
     fn previous(&mut self) {
@@ -1030,11 +1347,13 @@ impl App {
     }
 
     fn toggle_like(&mut self) {
-        let Some(track) = self.current_track().or_else(|| self.selected_track()).cloned() else {
+        let source = self.selected_track().or_else(|| self.current_track());
+        let Some(track) = source.cloned() else {
             self.status = Status::NothingToLike;
             return;
         };
         if self.net.liking(&track.id) { return; }
+        if self.list == ListKind::Likes { self.net.cancel_likes_list(); }
         let liked = !track.liked;
         // Flip the mark now and reconcile when the answer lands: a like is a
         // small action and waiting for the network would make it feel broken.
@@ -1051,6 +1370,11 @@ impl App {
             }
         };
         self.queue.iter_mut().for_each(update);
+        if let Some(parent) = self.artist_likes_parent.as_mut() {
+            for entry in &mut parent.entries {
+                if let Entry::Track(track) = entry { update(track); }
+            }
+        }
         self.entries.iter_mut().for_each(|e| {
             if let Entry::Track(t) = e {
                 update(t);
@@ -1061,23 +1385,31 @@ impl App {
     /// The like request came back: on failure, put the mark back as it was and
     /// say why, so the screen never claims something the server refused.
     fn finish_like(&mut self, track_id: String, liked: bool, result: anyhow::Result<Outcome>) -> bool {
-        if let Err(e) = result {
-            self.apply_like(&track_id, !liked);
-            self.status = Status::LikeFailed(format!("{e:#}"));
+        match result {
+            Ok(_) => self.apply_like(&track_id, liked),
+            Err(e) => {
+                self.apply_like(&track_id, !liked);
+                self.status = Status::LikeFailed(format!("{e:#}"));
+            }
         }
         true
     }
 
-    /// `s`: popular tracks of the playing (or selected) track's artist;
-    /// `S`: all of that artist's tracks.
+    /// `s` / `S` act on the selected track, never an unrelated playing one.
+    /// Playback is only the fallback when the current list has no track row.
     fn artist_search(&mut self, all: bool) {
-        // In an artist view, S/s switch between popular and all for that artist.
-        let from_list = matches!(self.list, ListKind::Artist(_) | ListKind::ArtistAll(_));
-        let source = if from_list { self.selected_track().or_else(|| self.current_track()) } else { self.current_track().or_else(|| self.selected_track()) };
+        let source = self.selected_track().or_else(|| self.current_track());
         let Some(track) = source.cloned() else {
             self.status = Status::ArtistNeedTrack;
             return;
         };
+        if self.list == ListKind::Likes {
+            self.artist_likes_parent = Some(LikesParent {
+                entries: self.entries.clone(),
+                selected: self.selected,
+                cursor: self.likes_list.clone(),
+            });
+        }
         self.await_job(Job::Artist { track, all });
     }
 
@@ -1123,10 +1455,243 @@ impl App {
         self.lyrics.as_ref().is_some_and(|v| v.manual.is_some())
     }
 
+    pub fn list_caption(&self) -> String {
+        let title = self.list.title(self.lang);
+        if self.list == ListKind::Likes && let Some(cursor) = &self.likes_list {
+            return format!("{title} · {}", fill(self.lang.t().likes_loaded, &[&self.entries.len().to_string(), &cursor.refs.len().to_string()]));
+        }
+        title
+    }
+
+    fn retain_likes_pages(&mut self) {
+        let ids: Vec<_> = self.likes_list.iter().chain(self.likes_queue.iter())
+            .chain(self.artist_likes_parent.iter().filter_map(|p| p.cursor.as_ref())).map(|c| c.id).collect();
+        self.net.retain_likes_pages(&ids);
+        self.likes_retry.retain(|id, _| ids.contains(id));
+    }
+
+    fn request_likes_page(&mut self, cursor: likes::Cursor) {
+        if !cursor.has_more() || self.net.loading_likes_page(cursor.id)
+            || self.likes_retry.get(&cursor.id).is_some_and(|at| Instant::now() < *at)
+        { return; }
+        self.net.post(Job::LikesMore { cursor });
+    }
+
+    fn finish_likes_page(&mut self, request: &likes::Cursor, result: anyhow::Result<Outcome>) {
+        let list_matches = self.likes_list.as_ref().is_some_and(|c| c.id == request.id && c.next == request.next);
+        let queue_matches = self.likes_queue.as_ref().is_some_and(|c| c.id == request.id && c.next == request.next);
+        let parent_matches = self.artist_likes_parent.as_ref().and_then(|p| p.cursor.as_ref())
+            .is_some_and(|c| c.id == request.id && c.next == request.next);
+        if !list_matches && !queue_matches && !parent_matches { return; }
+        let page = match result {
+            Ok(Outcome::LikesPage(page)) if page.next > request.next && page.next <= request.refs.len() => page,
+            other => {
+                self.likes_retry.insert(request.id, Instant::now() + Duration::from_secs(10));
+                let error = match other { Err(e) => e.to_string(), _ => self.lang.t().likes_page_error.into() };
+                self.status = Status::Failed(ListKind::Likes, error);
+                return;
+            }
+        };
+        self.likes_retry.remove(&request.id);
+        let clear_error = matches!(&self.status, Status::Failed(ListKind::Likes, _));
+        let old_queue_len = self.queue.len();
+        if list_matches {
+            self.entries.extend(page.tracks.iter().cloned().map(Entry::Track));
+            if let Some(cursor) = self.likes_list.as_mut() { cursor.next = page.next; }
+            if clear_error { self.status = Status::Loaded(ListKind::Likes, self.entries.len()); }
+            if self.entries.is_empty() && page.next < request.refs.len() {
+                if let Some(cursor) = self.likes_list.clone() { self.request_likes_page(cursor); }
+            } else if self.entries.is_empty() { self.focus = Focus::Nav; }
+        }
+        if parent_matches && let Some(parent) = self.artist_likes_parent.as_mut() {
+            parent.entries.extend(page.tracks.iter().cloned().map(Entry::Track));
+            if let Some(cursor) = parent.cursor.as_mut() { cursor.next = page.next; }
+        }
+        if queue_matches {
+            self.queue.extend(page.tracks);
+            if let Some(cursor) = self.likes_queue.as_mut() { cursor.next = page.next; }
+            if self.likes_waiting {
+                if self.queue.len() > old_queue_len { self.play_at(Some(old_queue_len)); }
+                else if page.next == request.refs.len() {
+                    let next = self.queue_pos.and_then(|cur| next_index(self.mode, self.queue.len(), cur, self.likes_wait_manual, &mut self.rng));
+                    self.play_at(next);
+                }
+            }
+        }
+    }
+
+    fn request_radio_list_more(&mut self) { self.request_radio_list_more_with_status(true); }
+
+    fn request_radio_list_more_with_status(&mut self, show_status: bool) {
+        if !matches!(self.list, ListKind::Wave | ListKind::TrackWave(_))
+            || self.net.loading_radio_more() || Instant::now() < self.radio_list_retry_at
+        { return; }
+        let (Some(radio), Some(Entry::Track(last))) = (&self.radio_list, self.entries.last()) else { return };
+        let known = self.entries.iter().filter_map(|e| match e { Entry::Track(t) => Some(t.id.clone()), _ => None }).collect();
+        let target = if self.entries.len() < self.radio_initial_target {
+            (self.radio_initial_target - self.entries.len()).min(radio::MORE_TRACKS)
+        } else { radio::MORE_TRACKS };
+        self.net.post(Job::RadioMore { view: self.radio_list_view, station: radio.station.clone(), queue: last.id.clone(), known, target });
+        if show_status { self.status = Status::Loading(self.list.clone()); }
+    }
+
+    fn finish_radio_list_more(&mut self, result: anyhow::Result<Outcome>) {
+        let window = match result {
+            Ok(Outcome::RadioWindow(window)) => window,
+            other => {
+                self.radio_list_retry_at = Instant::now() + Duration::from_secs(10);
+                self.radio_initial_target = 0;
+                self.status = Status::RadioFailed(match other { Err(e) => e.to_string(), _ => self.lang.t().radio_empty.into() });
+                return;
+            }
+        };
+        let Some(context) = self.radio_list.as_mut() else { return };
+        if context.station != window.station { return; }
+        let old_len = self.entries.len();
+        let old_queue_len = self.queue.len();
+        let mut seen: std::collections::HashSet<String> = self.entries.iter().filter_map(|e| match e { Entry::Track(t) => Some(t.id.clone()), _ => None }).collect();
+        for (track, batch_id) in window.tracks.into_iter().zip(window.batch_ids) {
+            if seen.insert(track.id.clone()) {
+                self.entries.push(Entry::Track(track));
+                context.batch_ids.push(batch_id);
+            }
+        }
+        if self.entries.len() == old_len {
+            self.radio_initial_target = 0;
+            self.radio_list_retry_at = Instant::now() + Duration::from_secs(10);
+            self.status = Status::RadioFailed(self.lang.t().radio_empty.into());
+            return;
+        }
+        if matches!(&self.status, Status::Loading(kind) if *kind == self.list) {
+            self.status = Status::Loaded(self.list.clone(), self.entries.len());
+        }
+        if self.radio_view_generation == Some(self.radio_generation) {
+            self.queue.extend(self.entries[old_len..].iter().filter_map(|e| match e { Entry::Track(t) => Some(t.clone()), _ => None }));
+            self.radio = Some(context.clone());
+            if self.radio_waiting { self.play_at(Some(old_queue_len)); }
+        }
+    }
+
+    pub fn buffering(&self) -> bool {
+        self.net.loading_stream() || self.radio_waiting || self.likes_waiting
+    }
+
+    fn detach_radio(&mut self) {
+        self.radio_generation = self.radio_generation.wrapping_add(1);
+        self.net.cancel_radio();
+        self.radio = None;
+        self.radio_waiting = false;
+        self.radio_cursor = None;
+        self.radio_retry_at = Instant::now();
+        self.radio_started_track = false;
+        self.radio_announced = false;
+        self.radio_since = None;
+        self.radio_heard = Duration::ZERO;
+    }
+
+    fn update_radio_clock(&mut self) {
+        if let Some(since) = self.radio_since.take()
+            && self.player.state() == PlayerState::Playing
+        {
+            self.radio_heard += since.elapsed();
+            if let Some(track) = self.current_track() { self.radio_heard = self.radio_heard.min(track.duration()); }
+            self.radio_since = Some(Instant::now());
+        }
+    }
+
+    fn send_radio_event(&mut self, kind: EventKind, track: bool) {
+        let Some(radio) = &self.radio else { return };
+        let Some(pos) = self.queue_pos else { return };
+        let Some(batch_id) = radio.batch_ids.get(pos) else { return };
+        let track_id = if track { self.current_track().map(|t| t.id.clone()) } else { None };
+        self.feedback_sequence += 1;
+        let event = radio::Feedback {
+            station: radio.station.clone(), batch_id: batch_id.clone(), kind, track_id,
+            played_seconds: self.radio_heard.as_secs_f64(),
+            timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+        };
+        self.net.post(Job::Feedback { sequence: self.feedback_sequence, event });
+    }
+
+    fn begin_radio_track(&mut self) {
+        if self.radio.is_none() || self.radio_started_track { return; }
+        if !self.radio_announced {
+            self.send_radio_event(EventKind::RadioStarted, false);
+            self.radio_announced = true;
+        }
+        self.send_radio_event(EventKind::TrackStarted, true);
+        self.radio_started_track = true;
+        self.radio_since = Some(Instant::now());
+    }
+
+    fn end_radio_track(&mut self, kind: EventKind) {
+        if !self.radio_started_track { return; }
+        self.update_radio_clock();
+        self.send_radio_event(kind, true);
+        self.radio_cursor = self.current_track().map(|t| t.id.clone());
+        self.radio_started_track = false;
+        self.radio_since = None;
+    }
+
+    fn request_radio_next(&mut self) {
+        if self.net.loading_radio() || Instant::now() < self.radio_retry_at || (!self.radio_started_track && !self.radio_waiting) { return; }
+        let (Some(radio), Some(track)) = (&self.radio, self.current_track()) else { return };
+        // Rotor advances after feedback for the preceding (finished/skipped)
+        // track. Sending the new playing track here can repeat the old batch.
+        if self.radio_cursor.is_none() && !self.radio_waiting && self.queue.len() > 1 { return; }
+        let queue = self.radio_cursor.clone().unwrap_or_else(|| track.id.clone());
+        self.net.post(Job::RadioNext { generation: self.radio_generation, station: radio.station.clone(), queue });
+    }
+
+    fn finish_radio_next(&mut self, result: anyhow::Result<Outcome>) {
+        let batch = match result {
+            Ok(Outcome::Radio(batch)) => batch,
+            other => {
+                self.radio_retry_at = Instant::now() + Duration::from_secs(10);
+                self.status = Status::RadioFailed(match other { Err(e) => e.to_string(), _ => self.lang.t().radio_empty.into() });
+                return;
+            }
+        };
+        let Some(radio) = self.radio.as_mut() else { return };
+        if radio.station != batch.station { return; }
+        let old_len = self.queue.len();
+        let mut seen: std::collections::HashSet<String> = self.queue.iter().rev().take(50).map(|t| t.id.clone()).collect();
+        for track in batch.tracks {
+            if seen.insert(track.id.clone()) {
+                self.queue.push(track);
+                radio.batch_ids.push(batch.batch_id.clone());
+            }
+        }
+        if self.queue.len() == old_len {
+            self.radio_retry_at = Instant::now() + Duration::from_secs(10);
+            if self.radio_waiting { self.status = Status::RadioFailed(self.lang.t().radio_empty.into()); }
+            return;
+        }
+        if self.radio_view_generation == Some(self.radio_generation) {
+            self.entries.extend(self.queue[old_len..].iter().cloned().map(Entry::Track));
+            self.radio_list = Some(radio.clone());
+        }
+        if self.radio_waiting { self.play_at(Some(old_len)); }
+    }
+
     pub fn tick(&mut self) {
         while self.collect_job() {}
+        if self.list == ListKind::Likes
+            && (self.entries.is_empty() || (self.focus == Focus::List && self.selected.saturating_add(likes::PREFETCH + 1) >= self.entries.len()))
+            && let Some(cursor) = self.likes_list.clone()
+        { self.request_likes_page(cursor); }
+        if (self.likes_waiting || self.queue_pos.is_some_and(|i| i.saturating_add(likes::PREFETCH + 1) >= self.queue.len()))
+            && let Some(cursor) = self.likes_queue.clone()
+        { self.request_likes_page(cursor); }
+        if self.entries.len() < self.radio_initial_target && !self.net.loading_stream() {
+            self.request_radio_list_more_with_status(false);
+        }
+        self.update_radio_clock();
         if self.player.finished() {
             self.advance(false);
+        }
+        if self.radio.is_some() && self.queue_pos.is_some_and(|i| self.queue.len().saturating_sub(i + 1) <= 3) {
+            self.request_radio_next();
         }
         for done in self.library.poll() {
             // Sync downloads report through the footer bar, not the status line.
@@ -1326,6 +1891,294 @@ mod tests {
     }
 
     #[test]
+    fn favourites_load_hundreds_at_rows_90_190_290_without_cursor_reset() {
+        let fake = FakeService::default().with_liked_tracks(350);
+        let log = fake.likes_log.clone();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        assert_eq!(a.entries.len(), 100);
+        assert_eq!(log.lock().unwrap().offsets, [0]);
+        assert!(a.list_caption().contains("100/350"));
+        a.selected = 88;
+        a.tick();
+        assert!(!a.net.is_busy());
+        for (row, count) in [(89, 200), (189, 300), (289, 350)] {
+            a.selected = row - 1;
+            press_wait(&mut a, KeyCode::Down);
+            assert_eq!(a.selected, row);
+            assert_eq!(a.entries.len(), count);
+        }
+        assert_eq!(log.lock().unwrap().offsets, [0, 100, 200, 300]);
+        let ids: Vec<_> = a.entries.iter().filter_map(|e| match e { Entry::Track(t) => Some(t.id.clone()), _ => None }).collect();
+        assert_eq!(ids, (1..=350).map(|id| id.to_string()).collect::<Vec<_>>());
+        a.selected = 349;
+        press_wait(&mut a, KeyCode::Down);
+        assert_eq!(log.lock().unwrap().offsets, [0, 100, 200, 300]);
+    }
+
+    #[test]
+    fn playback_prefetches_favourites_without_moving_selection() {
+        let fake = FakeService::default().with_liked_tracks(350);
+        let log = fake.likes_log.clone();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        a.play_at(Some(88));
+        settle(&mut a);
+        assert_eq!(a.queue.len(), 100);
+        press_wait(&mut a, KeyCode::Char('n'));
+        assert_eq!(a.queue_pos, Some(89));
+        assert_eq!(a.selected, 0);
+        assert_eq!(a.queue.len(), 200);
+        assert_eq!(a.entries.len(), 200);
+        assert_eq!(log.lock().unwrap().offsets, [0, 100]);
+    }
+
+    #[test]
+    fn end_of_loaded_favourites_waits_for_the_next_page_without_wrapping() {
+        for mode in [PlaybackMode::All, PlaybackMode::PlaylistLoop] {
+            let fake = FakeService::default().with_liked_tracks(350);
+            let log = fake.likes_log.clone();
+            let gate = crate::testing::Park::default();
+            gate.hold();
+            log.lock().unwrap().next_gate = Some(gate.clone());
+            let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+            press_wait(&mut a, KeyCode::Char('l'));
+            press_wait(&mut a, KeyCode::Enter);
+            a.mode = mode;
+            a.play_at(Some(99));
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while (a.player.state() != PlayerState::Playing || gate.calls() == 0) && Instant::now() < deadline {
+                a.tick(); std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(a.player.state(), PlayerState::Playing);
+            a.player.seek(a.current_track().unwrap().duration());
+            a.tick();
+            assert_eq!(a.queue_pos, Some(99));
+            assert!(a.likes_waiting);
+            assert!(a.buffering());
+            for _ in 0..5 { a.tick(); }
+            gate.release();
+            settle(&mut a);
+            assert_eq!(a.current_track().unwrap().id, "101");
+            assert_eq!(a.queue.len(), 200);
+            assert_eq!(a.queue_pos, Some(100));
+            assert_eq!(a.player.state(), PlayerState::Playing);
+            assert_eq!(log.lock().unwrap().offsets, [0, 100], "a pending page is never duplicated");
+        }
+    }
+
+    #[test]
+    fn unavailable_final_page_stops_or_loops_only_after_all_references_are_consumed() {
+        for (mode, expected) in [(PlaybackMode::All, None), (PlaybackMode::PlaylistLoop, Some(0))] {
+            let fake = FakeService::default().with_liked_tracks(150);
+            let gate = crate::testing::Park::default();
+            gate.hold();
+            {
+                let mut log = fake.likes_log.lock().unwrap();
+                log.empty_at.insert(100);
+                log.next_gate = Some(gate.clone());
+            }
+            let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+            press_wait(&mut a, KeyCode::Char('l'));
+            press_wait(&mut a, KeyCode::Enter);
+            a.mode = mode;
+            a.play_at(Some(99));
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while a.player.state() != PlayerState::Playing && Instant::now() < deadline { a.tick(); std::thread::sleep(Duration::from_millis(2)); }
+            a.advance(false);
+            assert!(a.likes_waiting);
+            gate.release();
+            settle(&mut a);
+            assert_eq!(a.queue_pos, expected);
+            assert!(!a.likes_waiting);
+            assert!(!a.likes_queue.as_ref().unwrap().has_more());
+        }
+    }
+
+    #[test]
+    fn favourites_paging_continues_while_browsing_another_section() {
+        let fake = FakeService::default().with_liked_tracks(350);
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Char('p'));
+        let playlists = a.entries.clone();
+        a.play_at(Some(89));
+        settle(&mut a);
+        assert_eq!(a.queue.len(), 200);
+        assert_eq!(a.entries, playlists);
+        assert_eq!(a.list, ListKind::Playlists);
+        let queue_id = a.likes_queue.as_ref().unwrap().id;
+        press_wait(&mut a, KeyCode::Char('l'));
+        assert_ne!(a.likes_list.as_ref().unwrap().id, queue_id);
+        assert_eq!(a.entries.len(), 100);
+        a.selected = 88;
+        press_wait(&mut a, KeyCode::Down);
+        assert_eq!(a.entries.len(), 200);
+        assert_eq!(a.queue.len(), 200, "the newly opened snapshot must not duplicate the old queue");
+        assert_eq!(a.current_track().unwrap().id, "90");
+    }
+
+    #[test]
+    fn paged_favourites_restore_cursor_queue_and_playback_position() {
+        let fake = FakeService::default().with_liked_tracks(350);
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        a.player.seek(Duration::from_secs(42));
+        a.selected = 3;
+        let fake = FakeService::default().with_liked_tracks(350);
+        let log = fake.likes_log.clone();
+        let mut b = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        b.restore(serde_json::from_str(&serde_json::to_string(&a.snapshot()).unwrap()).unwrap());
+        settle(&mut b);
+        assert!(log.lock().unwrap().offsets.is_empty(), "restored pages are not reloaded eagerly");
+        assert_eq!(b.entries.len(), 100);
+        assert_eq!(b.selected, 3);
+        assert_eq!(b.current_track().unwrap().id, "1");
+        assert_eq!(b.player.position().as_secs(), 42);
+        assert_eq!(b.player.state(), PlayerState::Paused);
+        b.selected = 88;
+        press_wait(&mut b, KeyCode::Down);
+        assert_eq!(b.entries.len(), 200);
+        assert_eq!(b.queue.len(), 200);
+        assert_eq!(log.lock().unwrap().offsets, [100]);
+        assert_eq!(b.player.position().as_secs(), 42);
+    }
+
+    #[test]
+    fn favourites_page_failure_retries_without_resetting_loaded_rows() {
+        let fake = FakeService::default().with_liked_tracks(350);
+        let log = fake.likes_log.clone();
+        log.lock().unwrap().fail_next = true;
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        a.selected = 88;
+        press_wait(&mut a, KeyCode::Down);
+        assert_eq!(a.entries.len(), 100);
+        assert_eq!(a.selected, 89);
+        assert!(matches!(a.status, Status::Failed(ListKind::Likes, _)));
+        let calls = log.lock().unwrap().offsets.len();
+        for _ in 0..10 { a.tick(); }
+        assert_eq!(log.lock().unwrap().offsets.len(), calls);
+        log.lock().unwrap().fail_next = false;
+        a.likes_retry.clear();
+        a.tick();
+        settle(&mut a);
+        assert_eq!(a.entries.len(), 200);
+        assert_eq!(a.selected, 89);
+    }
+
+    #[test]
+    fn unavailable_favourites_pages_advance_by_references_not_row_count() {
+        let fake = FakeService::default().with_liked_tracks(350);
+        let log = fake.likes_log.clone();
+        log.lock().unwrap().empty_at.insert(100);
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        a.selected = 88;
+        press_wait(&mut a, KeyCode::Down);
+        assert_eq!(log.lock().unwrap().offsets, [0, 100, 200]);
+        assert_eq!(a.entries.len(), 200);
+        assert_eq!(a.likes_list.as_ref().unwrap().next, 300);
+        assert!(matches!(&a.entries[100], Entry::Track(t) if t.id == "201"));
+    }
+
+    #[test]
+    fn like_edits_survive_pagination_and_only_reopening_removes_the_row() {
+        let fake = FakeService::default().with_liked_tracks(350);
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Char('L'));
+        assert!(!a.selected_track().unwrap().liked);
+        press_wait(&mut a, KeyCode::Char('L'));
+        assert!(a.selected_track().unwrap().liked);
+        press_wait(&mut a, KeyCode::Char('L'));
+        a.selected = 88;
+        press_wait(&mut a, KeyCode::Down);
+        assert_eq!(a.entries.len(), 200);
+        assert!(matches!(&a.entries[0], Entry::Track(t) if t.id == "1" && !t.liked));
+        press_wait(&mut a, KeyCode::Char('l'));
+        assert_eq!(a.entries.len(), 100);
+        assert_eq!(a.likes_list.as_ref().unwrap().refs.len(), 349);
+        assert!(matches!(&a.entries[0], Entry::Track(t) if t.id == "2"));
+    }
+
+    #[test]
+    fn unliking_keeps_favourites_rows_until_explicitly_reopened() {
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Down);
+        let id = a.selected_track().unwrap().id.clone();
+        let ids = |entries: &[Entry]| entries.iter().filter_map(|e| match e { Entry::Track(t) => Some(t.id.clone()), _ => None }).collect::<Vec<_>>();
+        let rows = ids(&a.entries);
+        let queue = a.queue.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+        let current = a.current_track().unwrap().id.clone();
+        let calls = gate.calls();
+        gate.hold();
+        press(&mut a, KeyCode::Char('L'));
+        assert!(!a.selected_track().unwrap().liked, "heart disappears immediately on the selected row");
+        assert_eq!(ids(&a.entries), rows);
+        assert_eq!(a.selected, 1);
+        gate.release();
+        settle(&mut a);
+        assert_eq!(gate.calls(), calls + 1, "only the like mutation, no catalogue reload");
+        assert_eq!(ids(&a.entries), rows);
+        assert_eq!(a.selected, 1);
+        assert!(!a.selected_track().unwrap().liked);
+        assert_eq!(a.queue.iter().map(|t| t.id.clone()).collect::<Vec<_>>(), queue);
+        assert_eq!(a.current_track().unwrap().id, current);
+        assert_eq!(a.player.state(), PlayerState::Playing);
+        // Re-enter the section from the Library block, not by refreshing a row.
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.focus, Focus::Nav);
+        press_wait(&mut a, KeyCode::Enter);
+        assert_eq!(a.entries.len(), rows.len() - 1);
+        assert!(!ids(&a.entries).contains(&id));
+        assert_eq!(a.current_track().unwrap().id, current);
+    }
+
+    #[test]
+    fn an_inflight_favourites_snapshot_cannot_replace_an_optimistic_unlike() {
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        press(&mut a, KeyCode::Down);
+        let rows = a.entries.len();
+        gate.hold();
+        a.await_job(Job::Likes);
+        press(&mut a, KeyCode::Char('L'));
+        assert!(!a.selected_track().unwrap().liked);
+        gate.release();
+        settle(&mut a);
+        assert_eq!(a.entries.len(), rows);
+        assert_eq!(a.selected, 1, "late snapshot cannot reset the cursor");
+        assert!(!a.selected_track().unwrap().liked, "late snapshot cannot restore the heart");
+    }
+
+    #[test]
+    fn failed_unlike_restores_the_heart_without_reloading_favourites() {
+        let fake = FakeService::parked().reject_likes();
+        let gate = fake.gate();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        press(&mut a, KeyCode::Down);
+        let rows = a.entries.len();
+        let calls = gate.calls();
+        press_wait(&mut a, KeyCode::Char('L'));
+        assert!(a.selected_track().unwrap().liked);
+        assert_eq!(a.entries.len(), rows);
+        assert_eq!(a.selected, 1);
+        assert_eq!(gate.calls(), calls + 1);
+        assert!(matches!(a.status, Status::LikeFailed(_)));
+    }
+
+    #[test]
     fn a_failed_like_rolls_back_even_when_a_list_is_requested() {
         let fake = FakeService::parked().reject_likes();
         let gate = fake.gate();
@@ -1343,6 +2196,55 @@ mod tests {
         assert_eq!(a.current_track().unwrap().liked, was, "failure must still be delivered");
         assert_eq!(a.current_track().unwrap().id, id);
         assert_eq!(a.list, ListKind::Playlists);
+    }
+
+    #[test]
+    fn space_during_restore_keeps_the_auto_advanced_track_and_position() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        // Auto-advance changes playback, not the user's highlighted row.
+        a.player.seek(a.current_track().unwrap().duration());
+        a.tick();
+        settle(&mut a);
+        assert_eq!(a.queue_pos, Some(1));
+        assert_eq!(a.selected, 0);
+        a.player.seek(Duration::from_secs(42));
+        let saved = a.snapshot();
+        let id = a.current_track().unwrap().id.clone();
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        gate.hold();
+        let mut b = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        b.restore(saved);
+        press(&mut b, KeyCode::Char(' '));
+        assert_eq!(b.current_track().unwrap().id, id, "Space must not play the old selected row");
+        assert!(b.pending_resume.is_some(), "saved seek survives the pending request");
+        gate.release();
+        settle(&mut b);
+        assert_eq!(b.current_track().unwrap().id, id);
+        assert_eq!(b.player.state(), PlayerState::Playing);
+        assert!((42..=43).contains(&b.player.position().as_secs()));
+    }
+
+    #[test]
+    fn space_twice_during_restore_still_restores_paused_at_saved_position() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        a.player.seek(Duration::from_secs(55));
+        let saved = a.snapshot();
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        gate.hold();
+        let mut b = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        b.restore(saved);
+        press(&mut b, KeyCode::Char(' '));
+        press(&mut b, KeyCode::Char(' '));
+        gate.release();
+        settle(&mut b);
+        assert_eq!(b.player.state(), PlayerState::Paused);
+        assert_eq!(b.player.position().as_secs(), 55);
     }
 
     #[test]
@@ -1377,6 +2279,366 @@ mod tests {
     }
 
     #[test]
+    fn track_radio_starts_playing_before_the_fifteen_track_fill_finishes() {
+        let fake = FakeService::default();
+        let gate = crate::testing::Park::default();
+        gate.hold();
+        {
+            let mut log = fake.radio.lock().unwrap();
+            log.initial_size = Some(5);
+            log.next_gate = Some(gate.clone());
+        }
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        press(&mut a, KeyCode::Char('W'));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while (a.player.state() != PlayerState::Playing || gate.calls() == 0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2)); a.tick();
+        }
+        let started = a.player.state() == PlayerState::Playing;
+        let first_len = a.entries.len();
+        let fetching = a.net.loading_radio_more();
+        gate.release();
+        settle(&mut a);
+        assert!(started, "audio starts while subsequent radio batches are blocked");
+        assert_eq!(first_len, 5, "first batch is already visible");
+        assert!(fetching);
+        assert_eq!(a.entries.len(), 15);
+    }
+
+    #[test]
+    fn both_radio_lists_start_with_fifteen_and_load_five_at_the_penultimate_row() {
+        for track_based in [false, true] {
+            let fake = FakeService::default();
+            let log = fake.radio.clone();
+            log.lock().unwrap().initial_size = Some(5);
+            let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+            if track_based {
+                press_wait(&mut a, KeyCode::Char('l'));
+                press_wait(&mut a, KeyCode::Char('W'));
+            } else {
+                // Browse ahead while an unrelated liked track is playing.
+                press_wait(&mut a, KeyCode::Char('l'));
+                press_wait(&mut a, KeyCode::Enter);
+                press_wait(&mut a, KeyCode::Char('w'));
+            }
+            assert_eq!(a.entries.len(), 15);
+            assert_eq!(a.radio_list.as_ref().unwrap().batch_ids.len(), 15);
+            let pos = a.queue_pos;
+            let current = a.current_track().unwrap().id.clone();
+            let events = log.lock().unwrap().events.len();
+            let calls = log.lock().unwrap().requests.len();
+            for _ in 0..12 { press_wait(&mut a, KeyCode::Down); }
+            assert_eq!(a.selected, 12);
+            assert_eq!(log.lock().unwrap().requests.len(), calls, "not near the end yet");
+            press_wait(&mut a, KeyCode::Down);
+            assert_eq!(a.selected, 13, "pagination preserves the cursor");
+            assert_eq!(a.entries.len(), 20, "penultimate row requests five more tracks");
+            assert_eq!(a.radio_list.as_ref().unwrap().batch_ids.len(), 20);
+            assert_eq!(a.current_track().unwrap().id, current);
+            assert_eq!(a.queue_pos, pos);
+            assert_eq!(a.player.state(), PlayerState::Playing);
+            assert_eq!(log.lock().unwrap().events.len(), events, "browsing never sends playback feedback");
+            let ids: std::collections::HashSet<_> = a.entries.iter().filter_map(|e| match e { Entry::Track(t) => Some(&t.id), _ => None }).collect();
+            assert_eq!(ids.len(), a.entries.len(), "no duplicates");
+            if track_based { assert_eq!(a.queue.len(), 20); }
+            else { assert_ne!(a.queue.len(), 20, "unrelated playback queue is untouched"); }
+            for _ in 0..5 { press_wait(&mut a, KeyCode::Down); }
+            assert_eq!(a.selected, 18);
+            assert_eq!(a.entries.len(), 25);
+        }
+    }
+
+    #[test]
+    fn repeated_radio_batches_do_not_create_fake_tracks_or_feedback() {
+        let fake = FakeService::default();
+        let log = fake.radio.clone();
+        {
+            let mut log = log.lock().unwrap();
+            log.initial_size = Some(5);
+            log.repeat_next = true;
+        }
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('w'));
+        assert_eq!(a.entries.len(), 5, "show the real available tracks, not repeated rows");
+        assert_eq!(log.lock().unwrap().requests.len(), 3, "stop after two unchanged responses");
+        for _ in 0..3 { press_wait(&mut a, KeyCode::Down); }
+        assert_eq!(a.entries.len(), 5);
+        let calls = log.lock().unwrap().requests.len();
+        for _ in 0..10 { press(&mut a, KeyCode::Down); a.tick(); }
+        assert_eq!(log.lock().unwrap().requests.len(), calls, "empty pages are throttled");
+        assert!(log.lock().unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn pending_radio_list_pagination_is_not_duplicated_and_cannot_reopen_home() {
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('w'));
+        a.selected = a.entries.len() - 3;
+        gate.hold();
+        press(&mut a, KeyCode::Down);
+        assert!(a.net.loading_radio_more());
+        let pending = a.net.is_busy();
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.net.is_busy(), pending);
+        a.open_section(Section::Home);
+        assert!(!a.net.loading_radio_more());
+        // Put another request behind the cancelled one to wait until the old
+        // response really has passed through the worker before asserting.
+        press(&mut a, KeyCode::Char('O'));
+        a.on_paste("1");
+        press(&mut a, KeyCode::Enter);
+        gate.release();
+        settle(&mut a);
+        assert!(!matches!(a.list, ListKind::Wave));
+        assert_eq!(a.entries.len(), 1);
+    }
+
+    #[test]
+    fn radio_prefetches_keeps_advancing_and_uses_original_batch_ids() {
+        let fake = FakeService::default();
+        let log = fake.radio.clone();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::En);
+        press_wait(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Enter);
+        let first_len = a.queue.len();
+        for _ in 0..first_len + 8 { press_wait(&mut a, KeyCode::Char('n')); }
+        assert!(a.queue_pos.unwrap() >= first_len + 8, "radio never wraps to the first batch");
+        assert!(a.queue.len() > first_len);
+        assert_eq!(a.entries.len(), a.queue.len());
+        let log = log.lock().unwrap();
+        assert_eq!(log.events[0].kind, EventKind::RadioStarted);
+        assert_eq!(log.events[1].kind, EventKind::TrackStarted);
+        assert_eq!(log.events[2].kind, EventKind::Skip);
+        assert_eq!(log.events[2].batch_id, "batch-1");
+        assert!(log.events.iter().any(|e| e.kind == EventKind::TrackStarted && e.batch_id != "batch-1"));
+        assert!(log.requests.iter().skip(1).all(|(_, queue)| queue.is_some()));
+    }
+
+    #[test]
+    fn natural_radio_completion_reports_finished_and_not_skip() {
+        let fake = FakeService::default();
+        let log = fake.radio.clone();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::En);
+        press_wait(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Enter);
+        let id = a.current_track().unwrap().id.clone();
+        a.radio_since = Some(Instant::now() - Duration::from_secs(4));
+        a.player.seek(a.current_track().unwrap().duration());
+        a.tick();
+        settle(&mut a);
+        let log = log.lock().unwrap();
+        let ended = log.events.iter().find(|e| e.kind == EventKind::TrackFinished).unwrap();
+        assert_eq!(ended.track_id.as_deref(), Some(id.as_str()));
+        assert!(ended.played_seconds >= 4.0 && ended.played_seconds < 5.0);
+        assert!(!log.events.iter().any(|e| e.kind == EventKind::Skip));
+    }
+
+    #[test]
+    fn radio_refill_does_not_replace_another_browsed_list() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Char('l'));
+        let liked = a.entries.clone();
+        let n = a.queue.len();
+        for _ in 0..n { press_wait(&mut a, KeyCode::Char('n')); }
+        assert!(a.queue.len() > n);
+        assert_eq!(a.list, ListKind::Likes);
+        assert_eq!(a.entries, liked);
+    }
+
+    #[test]
+    fn empty_radio_waits_without_looping_or_retrying_every_tick() {
+        let fake = FakeService::default();
+        let log = fake.radio.clone();
+        log.lock().unwrap().empty_next = true;
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::En);
+        press_wait(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Enter);
+        let last = a.queue.len() - 1;
+        a.play_at(Some(last));
+        settle(&mut a);
+        a.advance(false);
+        settle(&mut a);
+        assert_eq!(a.queue_pos, Some(last));
+        assert!(a.radio_waiting);
+        assert_eq!(a.player.state(), PlayerState::Stopped);
+        let calls = log.lock().unwrap().requests.len();
+        for _ in 0..20 { a.tick(); }
+        assert_eq!(log.lock().unwrap().requests.len(), calls);
+        log.lock().unwrap().empty_next = false;
+        a.radio_retry_at = Instant::now();
+        a.tick();
+        settle(&mut a);
+        assert_eq!(a.queue_pos, Some(last + 1));
+        assert_eq!(a.player.state(), PlayerState::Playing);
+    }
+
+    #[test]
+    fn changing_playback_queue_discards_a_stale_radio_batch() {
+        let fake = FakeService::parked();
+        let liked = fake.likes().unwrap();
+        let gate = fake.gate();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::En);
+        press_wait(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Enter);
+        let generation = a.radio_generation;
+        gate.hold();
+        a.radio_cursor = a.current_track().map(|t| t.id.clone());
+        a.request_radio_next();
+        assert!(a.net.loading_radio());
+        a.set_entries(ListKind::Likes, liked.into_iter().map(Entry::Track).collect());
+        a.play_from_list();
+        let queue = a.queue.clone();
+        assert_ne!(a.radio_generation, generation);
+        assert!(!a.net.loading_radio());
+        gate.release();
+        settle(&mut a);
+        assert!(a.radio.is_none());
+        assert_eq!(a.queue, queue, "late radio result cannot append into another queue");
+        assert_eq!(a.player.state(), PlayerState::Playing);
+    }
+
+    #[test]
+    fn failed_radio_refill_preserves_playback_and_retries_later() {
+        let fake = FakeService::default();
+        let log = fake.radio.clone();
+        log.lock().unwrap().fail_next = true;
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::En);
+        press_wait(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Enter);
+        let n = a.queue.len();
+        a.play_at(Some(n - 2));
+        settle(&mut a);
+        assert_eq!(a.player.state(), PlayerState::Playing);
+        assert_eq!(a.queue.len(), n);
+        assert!(matches!(a.status, Status::RadioFailed(_)));
+        let calls = log.lock().unwrap().requests.len();
+        for _ in 0..10 { a.tick(); }
+        assert_eq!(log.lock().unwrap().requests.len(), calls);
+        log.lock().unwrap().fail_next = false;
+        a.radio_retry_at = Instant::now();
+        a.tick();
+        settle(&mut a);
+        assert!(a.queue.len() > n);
+    }
+
+    #[test]
+    fn radio_listening_time_excludes_seek_and_pause() {
+        let fake = FakeService::default();
+        let log = fake.radio.clone();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::En);
+        press_wait(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Enter);
+        a.radio_since = Some(Instant::now() - Duration::from_secs(3));
+        a.update_radio_clock();
+        a.seek_by(100);
+        press(&mut a, KeyCode::Char(' '));
+        let heard = a.radio_heard;
+        assert!(a.radio_since.is_none());
+        a.tick();
+        assert_eq!(a.radio_heard, heard);
+        press_wait(&mut a, KeyCode::Char('n'));
+        let log = log.lock().unwrap();
+        let skip = log.events.iter().find(|e| e.kind == EventKind::Skip).unwrap();
+        assert!(skip.played_seconds >= 3.0 && skip.played_seconds < 4.0);
+    }
+
+    #[test]
+    fn track_wave_uses_the_selection_and_starts_playing() {
+        let fake = FakeService::default();
+        let log = fake.radio.clone();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Down);
+        let selected = a.selected_track().unwrap().id.clone();
+        assert_ne!(a.current_track().unwrap().id, selected);
+        press_wait(&mut a, KeyCode::Char('W'));
+        assert_eq!(log.lock().unwrap().requests[0].0, format!("track:{selected}"));
+        assert!(matches!(a.list, ListKind::TrackWave(_)));
+        assert_eq!(a.player.state(), PlayerState::Playing);
+    }
+
+    #[test]
+    fn link_dialog_opens_shared_track_independently_of_radio() {
+        let mut a = app();
+        press(&mut a, KeyCode::Char('O'));
+        a.on_paste("https://music.yandex.ru/album/99/track/4?from=share");
+        press_wait(&mut a, KeyCode::Enter);
+        assert!(a.link_dialog.is_none());
+        assert_eq!(a.current_track().unwrap().id, "4");
+        assert_eq!(a.queue.len(), 1);
+        assert!(a.radio.is_none());
+        assert_eq!(a.player.state(), PlayerState::Playing);
+        press(&mut a, KeyCode::Char('O'));
+        type_str(&mut a, "not a link");
+        press(&mut a, KeyCode::Enter);
+        assert!(a.link_dialog.as_ref().unwrap().error.is_some());
+        assert!(!a.should_quit);
+        press(&mut a, KeyCode::Esc);
+        assert!(a.link_dialog.is_none());
+        assert_eq!(a.current_track().unwrap().id, "4");
+    }
+
+    #[test]
+    fn cancelled_track_lookup_cannot_start_playback() {
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::En);
+        gate.hold();
+        press(&mut a, KeyCode::Char('O'));
+        a.on_paste("2");
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Esc);
+        gate.release();
+        settle(&mut a);
+        assert!(a.current_track().is_none());
+        assert!(a.link_dialog.is_none());
+    }
+
+    #[test]
+    fn a_new_shared_link_supersedes_a_cancelled_lookup() {
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::En);
+        gate.hold();
+        press(&mut a, KeyCode::Char('O'));
+        a.on_paste("2");
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Char('O'));
+        a.on_paste("4");
+        press(&mut a, KeyCode::Enter);
+        gate.release();
+        settle(&mut a);
+        assert_eq!(a.current_track().unwrap().id, "4");
+        assert!(a.link_dialog.is_none());
+        assert_eq!(a.queue.len(), 1);
+    }
+
+    #[test]
+    fn restored_radio_stays_paused_and_resumes_without_losing_context() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Enter);
+        let fake = FakeService::default();
+        let log = fake.radio.clone();
+        let mut b = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        b.restore(serde_json::from_str(&serde_json::to_string(&a.snapshot()).unwrap()).unwrap());
+        settle(&mut b);
+        assert_eq!(b.radio, a.radio);
+        assert_eq!(b.player.state(), PlayerState::Paused);
+        assert!(log.lock().unwrap().events.is_empty(), "no listening feedback for a paused restore");
+        press_wait(&mut b, KeyCode::Char(' '));
+        assert_eq!(log.lock().unwrap().events[0].kind, EventKind::RadioStarted);
+        assert_eq!(log.lock().unwrap().events[1].kind, EventKind::TrackStarted);
+    }
+
+    #[test]
     fn loop_key_cycles_modes_and_persists_them() {
         let mut a = app();
         for mode in [PlaybackMode::Repeat, PlaybackMode::PlaylistLoop, PlaybackMode::All] {
@@ -1397,7 +2659,7 @@ mod tests {
     #[test]
     fn natural_completion_stops_or_repeats_the_queue() {
         let mut a = app();
-        press_wait(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Char('l'));
         a.selected = a.entries.len() - 1;
         press_wait(&mut a, KeyCode::Enter);
         let last = a.queue_pos;
@@ -1569,12 +2831,143 @@ mod tests {
         press(&mut a, KeyCode::Char(' '));
         assert_eq!(a.player.state(), PlayerState::Paused);
 
-        let id = a.current_track().unwrap().id.clone();
-        let was = a.current_track().unwrap().liked;
+        let id = a.selected_track().unwrap().id.clone();
+        let was = a.selected_track().unwrap().liked;
         press(&mut a, KeyCode::Char('L'));
-        assert_eq!(a.current_track().unwrap().liked, !was);
+        assert_eq!(a.selected_track().unwrap().liked, !was);
         settle(&mut a);
         assert_eq!(a.service.likes().unwrap().iter().any(|t| t.id == id), !was);
+    }
+
+    #[test]
+    fn like_shortcut_targets_the_highlight_in_every_track_list() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        let playing = a.current_track().unwrap().clone();
+        for kind in [ListKind::Likes, ListKind::Wave, ListKind::Search("test".into()),
+            ListKind::Artist("test".into()), ListKind::ArtistAll("test".into()),
+            ListKind::Playlist("test".into()), ListKind::Cached, ListKind::TrackWave("test".into())]
+        {
+            press_wait(&mut a, KeyCode::Char('l'));
+            a.list = kind;
+            press(&mut a, KeyCode::Down);
+            let selected = a.selected_track().unwrap().clone();
+            assert_ne!(selected.id, playing.id);
+            // Like targeting does not depend on which panel has focus.
+            a.focus = Focus::Nav;
+            let entries = a.entries.len();
+            a.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
+            assert_eq!(a.selected_track().unwrap().liked, !selected.liked);
+            settle(&mut a);
+            assert_eq!(a.selected_track().unwrap().liked, !selected.liked);
+            assert_eq!(a.current_track().unwrap().liked, playing.liked);
+            assert_eq!(a.current_track().unwrap().id, playing.id);
+            assert_eq!(a.player.state(), PlayerState::Playing);
+            assert_eq!(a.selected, 1);
+            assert_eq!(a.entries.len(), entries);
+            assert_eq!(a.service.likes().unwrap().iter().any(|t| t.id == selected.id), !selected.liked);
+            // Toggling again acts on the same row.
+            press_wait(&mut a, KeyCode::Char('L'));
+            assert_eq!(a.selected_track().unwrap().liked, selected.liked);
+        }
+        press_wait(&mut a, KeyCode::Char('p'));
+        assert!(a.selected_track().is_none());
+        press_wait(&mut a, KeyCode::Char('L'));
+        assert_eq!(a.current_track().unwrap().liked, !playing.liked);
+    }
+
+    #[test]
+    fn artist_back_restores_likes_selection_cursor_and_playback() {
+        for key in ['s', 'S'] {
+            let mut a = app();
+            press_wait(&mut a, KeyCode::Char('l'));
+            press_wait(&mut a, KeyCode::Enter);
+            press(&mut a, KeyCode::Down);
+            let parent = a.entries.clone();
+            let cursor = a.likes_list.clone();
+            let queue = a.queue.clone();
+            let position = a.queue_pos;
+            press_wait(&mut a, KeyCode::Char(key));
+            assert!(a.can_back_to_likes());
+            // Switching popular/all tracks keeps the same return destination.
+            press_wait(&mut a, KeyCode::Char('S'));
+            a.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+            assert_eq!(a.list, ListKind::Likes);
+            assert_eq!(a.entries, parent);
+            assert_eq!(a.selected, 1);
+            assert_eq!(a.likes_list, cursor);
+            assert_eq!(a.queue, queue);
+            assert_eq!(a.queue_pos, position);
+            assert_eq!(a.player.state(), PlayerState::Playing);
+            assert_eq!(a.focus, Focus::List);
+            assert!(!a.net.is_busy(), "return does not reload Likes");
+            assert!(!a.can_back_to_likes());
+        }
+    }
+
+    #[test]
+    fn artist_back_cancels_an_unfinished_request() {
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        press(&mut a, KeyCode::Down);
+        let parent = a.entries.clone();
+        gate.hold();
+        press(&mut a, KeyCode::Char('s'));
+        a.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert!(!a.net.is_busy());
+        gate.release();
+        settle(&mut a);
+        assert_eq!(a.list, ListKind::Likes);
+        assert_eq!(a.entries, parent);
+        assert_eq!(a.selected, 1);
+    }
+
+    #[test]
+    fn artist_return_snapshot_receives_pages_and_heart_changes() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('l'));
+        let mut extra = a.selected_track().unwrap().clone();
+        extra.id = "extra".into();
+        let next = a.entries.len();
+        let cursor = likes::Cursor { id: 99, refs: vec!["ref".into(); next + 1], next };
+        a.likes_list = Some(cursor.clone());
+        press_wait(&mut a, KeyCode::Char('s'));
+        a.finish_likes_page(&cursor, Ok(Outcome::LikesPage(likes::Page {
+            tracks: vec![extra.clone()], refs: None, next: next + 1,
+        })));
+        a.apply_like(&extra.id, false);
+        a.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(a.entries.len(), next + 1);
+        assert_eq!(a.likes_list.as_ref().unwrap().next, next + 1);
+        assert!(matches!(a.entries.last(), Some(Entry::Track(t)) if t.id == extra.id && !t.liked));
+        press_wait(&mut a, KeyCode::Char('s'));
+        press_wait(&mut a, KeyCode::Char('p'));
+        assert!(!a.can_back_to_likes(), "opening another list discards the artist origin");
+    }
+
+    #[test]
+    fn artist_shortcuts_follow_the_highlight_not_the_playing_track() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter); // Neon Harbor is playing
+        let playing = a.current_track().unwrap().id.clone();
+        for (key, all) in [(KeyCode::Char('s'), false), (KeyCode::Char('S'), true)] {
+            press_wait(&mut a, KeyCode::Char('l'));
+            press(&mut a, KeyCode::Down); // Mira Vale is highlighted
+            assert_eq!(a.selected_track().unwrap().artist, "Mira Vale");
+            press_wait(&mut a, key);
+            assert_eq!(a.list, if all { ListKind::ArtistAll("Mira Vale".into()) } else { ListKind::Artist("Mira Vale".into()) });
+            assert!(a.entries.iter().all(|e| matches!(e, Entry::Track(t) if t.artist == "Mira Vale")));
+            assert_eq!(a.current_track().unwrap().id, playing);
+            assert_eq!(a.player.state(), PlayerState::Playing);
+        }
+        // With no selected track (only playlist rows), playback is a fallback.
+        press_wait(&mut a, KeyCode::Char('p'));
+        press_wait(&mut a, KeyCode::Char('s'));
+        assert_eq!(a.list, ListKind::Artist("Neon Harbor".into()));
     }
 
     #[test]
@@ -1648,6 +3041,8 @@ mod tests {
         let mut saved = a.snapshot();
         saved.entries.truncate(1);
         saved.queue.truncate(1);
+        saved.likes_list = None; // emulate a legacy session without pagination
+        saved.likes_queue = None;
         let track_id = saved.queue[0].id.clone();
 
         let mut b = app();
@@ -1665,6 +3060,8 @@ mod tests {
 
         let mut saved = b.snapshot();
         saved.entries.truncate(1);
+        saved.likes_list = None;
+        saved.likes_queue = None;
         saved.queue.clear();
         saved.queue_pos = None;
         let mut c = app();

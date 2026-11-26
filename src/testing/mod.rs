@@ -58,12 +58,35 @@ impl Park {
     }
 }
 
+#[derive(Default)]
+pub struct RadioLog {
+    pub requests: Vec<(String, Option<String>)>,
+    pub events: Vec<crate::radio::Feedback>,
+    pub empty_next: bool,
+    pub fail_next: bool,
+    pub initial_size: Option<usize>,
+    pub repeat_next: bool,
+    pub next_gate: Option<Park>,
+}
+
+#[derive(Default)]
+pub struct LikesLog {
+    pub offsets: Vec<usize>,
+    pub fail_next: bool,
+    pub empty_at: std::collections::HashSet<usize>,
+    pub next_gate: Option<Park>,
+}
+
 pub struct FakeService {
     tracks: Arc<Mutex<Vec<Track>>>,
     /// Playlists with their member track ids.
     playlists: Vec<(Playlist, Vec<String>)>,
     park: Park,
     reject_likes: bool,
+    stream_park: Option<Park>,
+    action_park: Option<Park>,
+    pub radio: Arc<Mutex<RadioLog>>,
+    pub likes_log: Arc<Mutex<LikesLog>>,
 }
 
 fn pl(id: &str, title: &str, ids: &[&str]) -> (Playlist, Vec<String>) {
@@ -108,7 +131,7 @@ impl Default for FakeService {
             pl("p2", "Фокус", &["6", "7", "4", "5"]),
             pl("p3", "По-русски", &["11", "12", "13", "14"]),
         ];
-        Self { tracks: Arc::new(Mutex::new(tracks)), playlists, park: Park::default(), reject_likes: false }
+        Self { tracks: Arc::new(Mutex::new(tracks)), playlists, park: Park::default(), reject_likes: false, stream_park: None, action_park: None, radio: Arc::default(), likes_log: Arc::default() }
     }
 }
 
@@ -125,6 +148,14 @@ impl FakeService {
 }
 
 impl FakeService {
+    pub fn with_liked_tracks(mut self, count: usize) -> Self {
+        self.tracks = Arc::new(Mutex::new((1..=count).map(|id| t(&id.to_string(), &format!("Track {id}"), "Artist", "Album", 200, true, false)).collect()));
+        self
+    }
+
+    pub fn with_stream_gate(mut self, gate: Park) -> Self { self.stream_park = Some(gate); self }
+    pub fn with_action_gate(mut self, gate: Park) -> Self { self.action_park = Some(gate); self }
+
     pub fn reject_likes(mut self) -> Self {
         self.reject_likes = true;
         self
@@ -175,9 +206,60 @@ impl MusicService for FakeService {
         Ok(out)
     }
 
+    fn radio_batch(&self, station: &str, queue: Option<&str>) -> Result<crate::radio::Batch> {
+        self.park.pass(GATE_TIMEOUT);
+        if queue.is_some() {
+            let gate = self.radio.lock().unwrap().next_gate.clone();
+            if let Some(gate) = gate { gate.pass(GATE_TIMEOUT); }
+        }
+        let mut radio = self.radio.lock().unwrap();
+        radio.requests.push((station.into(), queue.map(str::to_string)));
+        let n = radio.requests.len();
+        if queue.is_some() && radio.fail_next { bail!("test: radio unavailable"); }
+        let tracks = if queue.is_none() { self.my_wave()?.into_iter().take(radio.initial_size.unwrap_or(usize::MAX)).collect() }
+        else if radio.repeat_next { self.my_wave()?.into_iter().take(radio.initial_size.unwrap_or(5)).collect() }
+        else if radio.empty_next { Vec::new() }
+        else {
+            (0..5).map(|i| t(&(1000 + n * 10 + i).to_string(), "Next radio track", "Radio", "Radio", 200, false, false)).collect()
+        };
+        Ok(crate::radio::Batch { station: station.into(), batch_id: format!("batch-{n}"), tracks })
+    }
+
+    fn radio_feedback(&self, event: &crate::radio::Feedback) -> Result<()> {
+        self.park.pass(GATE_TIMEOUT);
+        self.radio.lock().unwrap().events.push(event.clone());
+        Ok(())
+    }
+
+    fn track(&self, id: &str) -> Result<Option<Track>> {
+        self.park.pass(GATE_TIMEOUT);
+        let id = id.split(':').next().unwrap_or(id);
+        Ok(self.tracks.lock().unwrap().iter().find(|t| t.id == id).cloned())
+    }
+
     fn likes(&self) -> Result<Vec<Track>> {
         self.park.pass(GATE_TIMEOUT);
         Ok(self.filter(|t| t.liked))
+    }
+
+    fn likes_page(&self, refs: Option<&[String]>, offset: usize, context: &crate::service::RequestContext) -> Result<crate::likes::Page> {
+        context.check()?;
+        self.park.pass(GATE_TIMEOUT);
+        let (gate, fail, empty) = {
+            let mut log = self.likes_log.lock().unwrap();
+            log.offsets.push(offset);
+            (log.next_gate.clone(), offset > 0 && log.fail_next, log.empty_at.contains(&offset))
+        };
+        if offset > 0 && let Some(gate) = gate { gate.pass(GATE_TIMEOUT); }
+        context.check()?;
+        if fail { bail!("test: favourites page unavailable"); }
+        let tracks = self.tracks.lock().unwrap();
+        let initial = refs.is_none();
+        let owned: Vec<_> = tracks.iter().filter(|t| t.liked).map(|t| t.id.clone()).collect();
+        let refs = refs.unwrap_or(&owned);
+        let next = offset.saturating_add(crate::likes::PAGE_SIZE).min(refs.len());
+        let rows = if empty { Vec::new() } else { refs.get(offset..next).unwrap_or_default().iter().filter_map(|id| tracks.iter().find(|t| &t.id == id).cloned()).collect() };
+        Ok(crate::likes::Page { tracks: rows, refs: initial.then(|| refs.to_vec()), next })
     }
 
     fn cached(&self) -> Result<Vec<Track>> {
@@ -192,7 +274,7 @@ impl MusicService for FakeService {
     }
 
     fn set_liked(&mut self, track_id: &str, liked: bool) -> Result<()> {
-        self.park.pass(GATE_TIMEOUT);
+        self.action_park.as_ref().unwrap_or(&self.park).pass(GATE_TIMEOUT);
         if self.reject_likes { bail!("test: like rejected"); }
         let mut tracks = self.tracks.lock().unwrap();
         let Some(track) = tracks.iter_mut().find(|t| t.id == track_id) else {
@@ -208,14 +290,14 @@ impl MusicService for FakeService {
     }
 
     fn stream(&self, _track_id: &str, _quality: Quality) -> Result<Option<Stream>> {
-        self.park.pass(GATE_TIMEOUT);
+        self.stream_park.as_ref().unwrap_or(&self.park).pass(GATE_TIMEOUT);
         Ok(None)
     }
 
     fn clone_boxed(&self) -> Box<dyn MusicService> {
         // The gate is shared on purpose: a test holds one gate and both the
         // worker's copy and its own copy obey it.
-        Box::new(Self { tracks: self.tracks.clone(), playlists: self.playlists.clone(), park: self.park.clone(), reject_likes: self.reject_likes })
+        Box::new(Self { tracks: self.tracks.clone(), playlists: self.playlists.clone(), park: self.park.clone(), reject_likes: self.reject_likes, stream_park: self.stream_park.clone(), action_park: self.action_park.clone(), radio: self.radio.clone(), likes_log: self.likes_log.clone() })
     }
 }
 

@@ -3,7 +3,7 @@
 
 use ratatui::{
     buffer::Buffer,
-    layout::{Alignment, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     symbols::Marker,
     text::{Line, Span},
@@ -96,7 +96,7 @@ fn emblem(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
 
 pub(super) fn state_label(app: &App) -> &'static str {
     let t = app.lang.t();
-    if app.net.loading_stream() { return t.buffering; }
+    if app.buffering() { return t.buffering; }
     match app.player.state() {
         PlayerState::Playing => t.states[0],
         PlayerState::Paused => t.states[1],
@@ -104,13 +104,21 @@ pub(super) fn state_label(app: &App) -> &'static str {
     }
 }
 
+/// Clip a title by terminal-cell width, reserving a cell for the ellipsis.
+pub(super) fn ellipsize(text: &str, width: usize) -> String {
+    if width == 0 { return String::new(); }
+    if text_width(text) <= width { return text.to_string(); }
+    let mut out = String::new();
+    for ch in text.chars() {
+        out.push(ch);
+        if text_width(&out) > width - 1 { out.pop(); break; }
+    }
+    out.push('…');
+    out
+}
+
 pub(super) fn header(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
     let t = app.lang.t();
-    let left = Rect { x: area.x + 1, width: area.width.saturating_sub(1), ..area };
-    emblem(frame, left, app, p);
-
-    // Wordmark: letter-spaced, quiet subtitle, then where the music comes from.
-    let mark = Rect { x: left.x + EMBLEM_W + 2, width: left.width.saturating_sub(EMBLEM_W + 2), ..left };
     let wordmark = vec![
         Line::from(Span::styled("y a m u s i q", Style::default().fg(p.accent).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled(t.tagline, Style::default().fg(p.text))),
@@ -119,9 +127,6 @@ pub(super) fn header(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
             Style::default().fg(p.muted),
         )),
     ];
-    frame.render_widget(Paragraph::new(wordmark), mark);
-
-    // Right: what's on, in plain words.
     let (pos, dur) = match app.current_track() {
         Some(tr) => (app.player.position(), tr.duration()),
         None => (Default::default(), Default::default()),
@@ -142,9 +147,57 @@ pub(super) fn header(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
             Style::default().fg(p.muted),
         )),
     ];
-    let summary_w = summary.iter().map(Line::width).max().unwrap_or(0) as u16 + 1;
-    let right = Rect { x: (area.x + area.width).saturating_sub(summary_w), width: summary_w.min(area.width), ..area };
-    frame.render_widget(Paragraph::new(summary).alignment(Alignment::Right), right);
+    // Give the brand and summary their own bounds. The centre can shrink
+    // without its title ever painting over either neighbouring block.
+    let brand_w = EMBLEM_W + 2 + wordmark.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let summary_w = summary.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let inside = Rect { x: area.x + u16::from(area.width > 0), width: area.width.saturating_sub(2), ..area };
+    let columns = Layout::horizontal([Constraint::Length(brand_w), Constraint::Min(0), Constraint::Length(summary_w)])
+        .spacing(11).split(inside);
+    emblem(frame, columns[0], app, p);
+    let mark_offset = (EMBLEM_W + 2).min(columns[0].width);
+    let mark = Rect { x: columns[0].x + mark_offset, width: columns[0].width - mark_offset, ..columns[0] };
+    frame.render_widget(Paragraph::new(wordmark), mark);
+    frame.render_widget(Paragraph::new(summary).alignment(Alignment::Right), columns[2]);
+    now_playing(frame, columns[1], app, p);
+}
+
+fn now_playing(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
+    if area.width == 0 || area.height == 0 { return; }
+    let Some(track) = app.current_track() else {
+        if area.height >= 2 {
+            let title = ellipsize(app.lang.t().not_playing, usize::from(area.width));
+            frame.render_widget(Paragraph::new(title).alignment(Alignment::Center).style(Style::default().fg(p.muted)), Rect { y: area.y + 1, height: 1, ..area });
+        }
+        return;
+    };
+    let icon = match app.player.state() {
+        PlayerState::Playing => "▶",
+        PlayerState::Paused => "⏸",
+        PlayerState::Stopped => "",
+    };
+    frame.render_widget(Paragraph::new(icon).alignment(Alignment::Center).style(Style::default().fg(p.accent)), Rect { height: 1, ..area });
+    if area.height < 2 { return; }
+    let title = ellipsize(&track.title, usize::from(area.width));
+    frame.render_widget(Paragraph::new(title).alignment(Alignment::Center).style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD)), Rect { y: area.y + 1, height: 1, ..area });
+    if area.height < 3 { return; }
+    let pos = app.player.position().min(track.duration());
+    let elapsed = format_time(pos);
+    let duration = format_time(track.duration());
+    let elapsed_w = text_width(&elapsed) as u16;
+    let duration_w = text_width(&duration) as u16;
+    let row = Rect { y: area.y + 2, height: 1, ..area };
+    if area.width < elapsed_w + duration_w + 3 {
+        let times = ellipsize(&format!("{elapsed} / {duration}"), usize::from(area.width));
+        frame.render_widget(Paragraph::new(times).alignment(Alignment::Center).style(Style::default().fg(p.muted)), row);
+        return;
+    }
+    let buf = frame.buffer_mut();
+    set_str(buf, row, 0, 0, &elapsed, Style::default().fg(p.text));
+    set_str(buf, row, area.width - duration_w, 0, &duration, Style::default().fg(p.muted));
+    let bar = Rect { x: row.x + elapsed_w + 1, width: area.width - elapsed_w - duration_w - 2, ..row };
+    let ratio = if track.duration().is_zero() { 0.0 } else { pos.as_secs_f64() / track.duration().as_secs_f64() };
+    thin_bar(buf, bar, ratio, p);
 }
 
 /// Six labelled frequency bands drawn as thin rules with a peak-hold tick.
@@ -189,28 +242,6 @@ pub(super) fn thin_bar(buf: &mut Buffer, area: Rect, ratio: f64, p: &Palette) {
     }
 }
 
-/// Timeline: thin rule with a bright playhead, light ticks and time labels.
-pub(super) fn timeline(buf: &mut Buffer, area: Rect, ratio: f64, ticks: &[String], p: &Palette) {
-    if area.width < 10 || area.height == 0 {
-        return;
-    }
-    thin_bar(buf, Rect { height: 1, ..area }, ratio, p);
-    let head = ((f64::from(area.width - 1)) * ratio.clamp(0.0, 1.0)).round() as u16;
-    set(buf, area, head, 0, "●", Style::default().fg(p.accent));
-    if area.height < 2 {
-        return;
-    }
-    let n = ticks.len().max(1) as u16;
-    for (k, label) in ticks.iter().enumerate() {
-        let x = area.width * k as u16 / n;
-        let next = area.width * (k as u16 + 1) / n;
-        set(buf, area, x, 1, "╵", Style::default().fg(p.line));
-        if text_width(label) + 2 < usize::from(next - x) {
-            set_str(buf, area, x + 1, 1, label, Style::default().fg(p.muted));
-        }
-    }
-}
-
 /// Signal history as a single smooth braille line.
 pub(super) fn signal(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
     if inner.width < 2 || inner.height == 0 {
@@ -241,6 +272,22 @@ pub(super) fn signal(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
             }),
         inner,
     );
+}
+
+/// Wrap at whitespace boundaries only; a word wider than the column stays
+/// intact for the renderer to ellipsize, never split into multiple rows.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && text_width(&current) + 1 + text_width(word) > width {
+            rows.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() { current.push(' '); }
+        current.push_str(word);
+    }
+    if !current.is_empty() || rows.is_empty() { rows.push(current); }
+    rows
 }
 
 /// Track card: bright title, artist beneath, then a quiet dot-leader table.
@@ -285,7 +332,25 @@ pub(super) fn info(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
             } else if let Some(saved) = app.library.saved(&tr.id) {
                 lines.push(row(keys[5], format!("{} · {}", t.file_saved, saved.quality)));
             }
-            lines.push(row(keys[0], tr.album.clone()));
+            let indent = key_w + 1;
+            let width = usize::from(inner.width);
+            if width > indent {
+                let value_width = width - indent;
+                for (i, text) in wrap_words(&tr.album, value_width).into_iter().enumerate() {
+                    let text = ellipsize(&text, value_width);
+                    if i == 0 { lines.push(row(keys[0], text)); }
+                    else {
+                        lines.push(Line::from(vec![Span::raw(" ".repeat(indent)), Span::styled(text, Style::default().fg(p.text))]));
+                    }
+                }
+            } else {
+                // Very narrow cards have no value column; put the album below
+                // its label, using the available width rather than overflowing.
+                lines.push(row(keys[0], String::new()));
+                for text in wrap_words(&tr.album, width) {
+                    lines.push(Line::from(Span::styled(ellipsize(&text, width), Style::default().fg(p.text))));
+                }
+            }
             lines.push(row(keys[1], format_time(tr.duration())));
         }
         None => {
@@ -305,6 +370,25 @@ pub(super) fn info(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
 #[cfg(test)]
 mod tests {
     use super::quiet;
+
+    #[test]
+    fn album_wrap_uses_word_boundaries_and_display_width() {
+        assert_eq!(super::wrap_words("один два три", 8), ["один два", "три"]);
+        assert_eq!(super::wrap_words("one two three", 7), ["one two", "three"]);
+        assert_eq!(super::wrap_words("夜空 星々", 4), ["夜空", "星々"]);
+        assert_eq!(super::wrap_words("unbreakableword next", 5), ["unbreakableword", "next"]);
+        assert_eq!(super::wrap_words("", 10), [""]);
+    }
+
+    #[test]
+    fn long_titles_are_clipped_by_terminal_width() {
+        assert_eq!(super::ellipsize("abcdef", 4), "abc…");
+        assert_eq!(super::ellipsize("界界界", 5), "界界…");
+        assert_eq!(super::ellipsize("Север", 3), "Се…");
+        assert_eq!(super::ellipsize("abcdef", 1), "…");
+        assert_eq!(super::ellipsize("abcdef", 0), "");
+        assert_eq!(super::ellipsize("abc", 3), "abc");
+    }
 
     #[test]
     fn quiet_folds_label_but_keeps_data() {

@@ -73,6 +73,12 @@ impl Client {
         result(req.send_form(form), path)
     }
 
+    pub fn post_json(&self, path: &str, query: &[(&str, &str)], body: Value) -> Result<Value> {
+        let mut req = self.authed(self.agent.post(&format!("{}{path}", self.base())));
+        for (key, value) in query { req = req.query(key, value); }
+        result(req.send_json(body), path)
+    }
+
     /// Fetch an absolute URL (download-info, lyrics files) as text.
     pub fn get_text(&self, url: &str, auth: bool) -> Result<String> {
         let mut req = self.agent.get(url);

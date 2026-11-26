@@ -131,7 +131,7 @@ fn scene(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
                 format_time(tr.duration())
             )
         }
-        (None, Some(tr)) if state == PlayerState::Playing || app.net.loading_stream() => {
+        (None, Some(tr)) if state == PlayerState::Playing || app.buffering() => {
             format!("{} · {} / {}", t_txt.buffering, format_time(app.player.position()), format_time(tr.duration()))
         }
         _ => t_txt.no_signal.to_string(),
@@ -176,22 +176,29 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 /// bright now, soft grey next, fading into the background behind.
 fn lyrics(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
     let t = app.lang.t();
-    let Some(view) = app.lyrics.as_ref().filter(|v| app.current_track().is_some_and(|tr| tr.id == v.track_id)) else {
-        return;
-    };
+    let Some(track) = app.current_track() else { return };
+    let view = app.lyrics.as_ref().filter(|v| v.track_id == track.id);
     let buf = frame.buffer_mut();
     let corner = |buf: &mut ratatui::buffer::Buffer, s: &str| {
         let x = inner.width.saturating_sub(text_width(s) as u16 + 1);
         set_str(buf, inner, x, 0, &format!(" {s}"), Style::default().fg(p.muted).bg(p.bg));
     };
-    let Some(lyr) = view.lyrics.as_ref() else {
-        corner(buf, t.lyrics_none);
-        return;
-    };
     if !app.show_lyrics {
         corner(buf, t.lyrics_hidden);
         return;
     }
+    let lyrics = view.and_then(|v| v.lyrics.as_ref()).filter(|l| l.lines.iter().any(|line| !line.text.trim().is_empty()));
+    let Some(lyr) = lyrics else {
+        if view.is_some() { corner(buf, t.lyrics_none); }
+        let title = super::parts::ellipsize(&track.title, usize::from(inner.width.saturating_sub(2)));
+        let x = inner.width.saturating_sub(text_width(&title) as u16) / 2;
+        let y = inner.height / 2;
+        set_str(buf, inner, x.saturating_sub(1), y, " ", Style::default().bg(p.bg));
+        set_str(buf, inner, x, y, &title, Style::default().fg(p.accent).bg(p.bg).add_modifier(Modifier::BOLD));
+        set_str(buf, inner, x + text_width(&title) as u16, y, " ", Style::default().bg(p.bg));
+        return;
+    };
+    let Some(view) = view else { return };
     if app.lyrics_manual() {
         corner(buf, t.lyrics_manual);
     } else if !lyr.synced {

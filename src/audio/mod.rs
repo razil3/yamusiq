@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -169,6 +169,7 @@ fn fill_output(shared: &Shared, out: &mut [f32], ch: usize) {
 /// Runs `ffmpeg … -f f32le -` and feeds its output into `shared.queue` from a
 /// background thread, with back-pressure so only a few seconds are buffered.
 fn spawn_decoder(source: &str, at: Duration, rate: u32, channels: u16, shared: Arc<Shared>, generation: u64) -> Result<crate::detach::Proc> {
+    let started = Instant::now();
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
     if source.starts_with("http://") || source.starts_with("https://") {
@@ -188,6 +189,7 @@ fn spawn_decoder(source: &str, at: Duration, rate: u32, channels: u16, shared: A
     thread::spawn(move || {
         let mut buf = vec![0u8; 32 * 1024];
         let mut carry: Vec<u8> = Vec::with_capacity(4);
+        let mut first_pcm = true;
         let current = || shared.generation.load(Ordering::SeqCst) == generation;
         loop {
             if !current() {
@@ -212,6 +214,10 @@ fn spawn_decoder(source: &str, at: Duration, rate: u32, channels: u16, shared: A
                         return;
                     }
                     shared.queue.lock().unwrap().extend(samples);
+                    if whole > 0 && first_pcm {
+                        first_pcm = false;
+                        crate::timing::record("audio.first_pcm", started.elapsed());
+                    }
                     carry.drain(..whole);
                 }
             }

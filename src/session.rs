@@ -25,6 +25,14 @@ pub struct Session {
     pub queue: Vec<Track>,
     pub queue_pos: Option<usize>,
     pub position_secs: f64,
+    #[serde(default)]
+    pub radio: Option<crate::radio::Session>,
+    #[serde(default)]
+    pub radio_list: Option<crate::radio::Session>,
+    #[serde(default)]
+    pub likes_list: Option<crate::likes::Cursor>,
+    #[serde(default)]
+    pub likes_queue: Option<crate::likes::Cursor>,
     pub mode: PlaybackMode,
     pub volume: u8,
 }

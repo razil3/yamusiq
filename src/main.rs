@@ -1,4 +1,8 @@
 mod app;
+mod radio;
+mod links;
+mod likes;
+mod timing;
 mod audio;
 mod cli;
 mod config;
@@ -19,10 +23,11 @@ mod yandex;
 
 use std::io::{self, stdout, Write};
 use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event},
+    event::{self, Event, EnableBracketedPaste, DisableBracketedPaste},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
@@ -38,10 +43,26 @@ use yandex::YandexService;
 /// xterm "push/pop window title": keeps the user's own title to restore on exit.
 const PUSH_TITLE: &str = "\x1b[22;0t";
 const POP_TITLE: &str = "\x1b[23;0t";
+const RESET_BACKGROUND: &str = "\x1b]111\x1b\\";
+static BACKGROUND_CHANGED: AtomicBool = AtomicBool::new(false);
+
+fn background_sequence(color: ratatui::style::Color) -> Option<String> {
+    match color {
+        ratatui::style::Color::Rgb(r, g, b) => Some(format!("\x1b]11;rgb:{r:02x}/{g:02x}/{b:02x}\x1b\\")),
+        _ => None,
+    }
+}
+
+fn reset_background(out: &mut impl Write, changed: &AtomicBool) -> io::Result<()> {
+    if changed.swap(false, Ordering::AcqRel) { out.write_all(RESET_BACKGROUND.as_bytes())?; }
+    Ok(())
+}
+
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+    let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen, crossterm::cursor::Show);
+    let _ = reset_background(&mut stdout(), &BACKGROUND_CHANGED);
     let _ = write!(stdout(), "{POP_TITLE}");
     let _ = stdout().flush();
 }
@@ -161,10 +182,20 @@ fn real_main() -> Result<()> {
     }));
 
     write!(stdout(), "{PUSH_TITLE}")?;
-    enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-    let result = run(&mut terminal, Box::new(service), player, library, problem);
+    let result = (|| {
+        enable_raw_mode()?;
+        execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        if let Some(sequence) = background_sequence(app::PALETTE.bg) {
+            // Default terminal background also colours terminal-owned padding
+            // where OSC 11 is supported. Mark before writing so partial setup
+            // failures still attempt the profile-background reset.
+            BACKGROUND_CHANGED.store(true, Ordering::Release);
+            write!(stdout(), "{sequence}")?;
+            stdout().flush()?;
+        }
+        let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+        run(&mut terminal, Box::new(service), player, library, problem)
+    })();
     restore_terminal();
     result
 }
@@ -196,10 +227,12 @@ fn run(
             titled = Some(app.lang);
         }
         terminal.draw(|frame| ui::draw(frame, &app))?;
-        if event::poll(Duration::from_millis(80))?
-            && let Event::Key(key) = event::read()?
-        {
-            app.on_key(key);
+        if event::poll(Duration::from_millis(80))? {
+            match event::read()? {
+                Event::Key(key) => app.on_key(key),
+                Event::Paste(text) => app.on_paste(&text),
+                _ => {}
+            }
         }
         app.tick();
     }
@@ -211,4 +244,28 @@ fn run(
         let _ = updated.save();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    #[test]
+    fn background_uses_the_same_rgb_as_the_ui() {
+        assert_eq!(background_sequence(app::PALETTE.bg).unwrap(), "\x1b]11;rgb:11/11/13\x1b\\");
+        assert!(background_sequence(ratatui::style::Color::Reset).is_none());
+    }
+
+    #[test]
+    fn cleanup_resets_the_profile_background_only_once() {
+        let changed = AtomicBool::new(true);
+        let mut out = Vec::new();
+        reset_background(&mut out, &changed).unwrap();
+        reset_background(&mut out, &changed).unwrap();
+        assert_eq!(out, RESET_BACKGROUND.as_bytes());
+        assert!(!changed.load(Ordering::Acquire));
+        let mut unchanged = Vec::new();
+        reset_background(&mut unchanged, &AtomicBool::new(false)).unwrap();
+        assert!(unchanged.is_empty(), "do not reset a background the app never changed");
+    }
 }

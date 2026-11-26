@@ -30,8 +30,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(Block::default().style(Style::default().bg(p.bg).fg(p.text)), area);
 
     let bottom_h = match area.height {
-        30.. => 8,
-        22..=29 => 4,
+        22.. => 3,
         _ => 0,
     };
     let gap = u16::from(area.height >= 24);
@@ -43,7 +42,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Constraint::Min(8),
             Constraint::Length(bottom_h),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(footer_height(app, area.width)),
         ])
         .split(area);
     parts::header(frame, rows[0], app, p);
@@ -57,6 +56,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.help {
         draw_help(frame, area, app, p);
     }
+    if app.link_dialog.is_some() { draw_link_dialog(frame, area, app, p); }
 }
 
 // ── primitives ───────────────────────────────────────────────────────────────
@@ -127,6 +127,7 @@ fn panel(frame: &mut Frame, area: Rect, label: &str, hint: &str, focused: bool, 
     if framed {
         let block = frame_block(hint, focused, p).title(Line::from(vec![
             Span::raw(" "),
+            Span::styled(if focused { "● " } else { "" }, Style::default().fg(p.accent)),
             Span::styled(label.to_string(), title_style),
             Span::raw(" "),
         ]));
@@ -199,7 +200,7 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
 fn draw_list(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
     let t = app.lang.t();
     let focused = app.focus == Focus::List;
-    let playlists = matches!(app.entries.first(), Some(Entry::Playlist(_)));
+    let playlists = matches!(app.list, crate::app::ListKind::Playlists);
     let hint = if playlists {
         t.hint_list_playlists
     } else if matches!(app.list, crate::app::ListKind::Artist(_) | crate::app::ListKind::ArtistAll(_)) {
@@ -207,15 +208,23 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
     } else {
         t.hint_list
     };
-    let in_playlist = matches!(app.list, crate::app::ListKind::Playlist(_));
-    let inner = framed_panel(frame, area, &app.list.title(app.lang), if in_playlist { "" } else { hint }, focused, p);
-    if in_playlist && area.height > 0 {
-        // Back navigation has priority on narrow panels. Other hints use only
-        // the remaining space, so they cannot overwrite the left-hand hint.
+    let back_hint = if app.can_back_to_likes() { Some(t.hint_back_likes) }
+        else if matches!(app.list, crate::app::ListKind::Playlist(_)) { Some(t.hint_back_playlists) }
+        else { None };
+    let back_width = if let Some(back_hint) = back_hint { (text_width(back_hint) as u16 + 2).min(area.width.saturating_sub(2)) } else { 0 };
+    let available = usize::from(area.width.saturating_sub(4 + back_width));
+    let full = if playlists { hint.to_string() } else { format!("{hint} · {}", t.hint_track_actions.join(" · ")) };
+    let compact = if matches!(app.list, crate::app::ListKind::Artist(_) | crate::app::ListKind::ArtistAll(_)) { t.hint_artist_compact } else { t.hint_list_compact };
+    let hint = if playlists || text_width(&full) <= available { full.as_str() }
+        else if text_width(compact) <= available { compact }
+        else { t.hint_action_keys };
+    let inner = framed_panel(frame, area, &app.list_caption(), if back_hint.is_some() { "" } else { hint }, focused, p);
+    if let Some(back_hint) = back_hint.filter(|_| area.height > 0) {
+        // Keep back navigation on the left, with the other actions sharing
+        // the same bottom border instead of occupying extra screen rows.
         let width = area.width.saturating_sub(2);
-        let back_width = (text_width(t.hint_back_playlists) as u16 + 2).min(width);
         let back = Rect::new(area.x + 1, area.y + area.height - 1, back_width, 1);
-        frame.render_widget(Paragraph::new(hint_line(t.hint_back_playlists, p)), back);
+        frame.render_widget(Paragraph::new(hint_line(back_hint, p)), back);
         let rest = Rect::new(back.x + back_width, back.y, width - back_width, 1);
         frame.render_widget(Paragraph::new(hint_line(hint, p)).alignment(Alignment::Right), rest);
     }
@@ -330,31 +339,13 @@ fn draw_library(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
     frame.render_stateful_widget(List::new(items).highlight_style(highlight).highlight_symbol("› "), inner, &mut state);
 }
 
-// ── bottom: timeline and volume ──────────────────────────────────────────────
+// ── bottom: volume ──────────────────────────────────────────────────────────
 
 fn draw_bottom(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
     let t = app.lang.t();
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(0)])
-        .spacing(1)
-        .split(area);
-
-    let (pos, dur) = match app.current_track() {
-        Some(tr) => (app.player.position(), tr.duration()),
-        None => (Default::default(), Default::default()),
-    };
-    let ratio = if dur.is_zero() { 0.0 } else { pos.as_secs_f64() / dur.as_secs_f64() };
-    let label = format!("{}   {} / {}", t.lbl_progress, format_time(pos), format_time(dur));
-    let inner = hud_panel(frame, rows[0], &label, t.hint_progress, false, p);
-    let ticks: Vec<String> = (0..10).map(|k| format_time(dur.mul_f64(f64::from(k) / 10.0))).collect();
-    parts::timeline(frame.buffer_mut(), inner, ratio, &ticks, p);
-
-    if rows[1].height >= 3 {
-        let label = fill(t.lbl_volume, &[&app.volume.to_string()]);
-        let inner = hud_panel(frame, rows[1], &label, t.hint_volume, false, p);
-        parts::thin_bar(frame.buffer_mut(), Rect { height: 1, ..inner }, f64::from(app.volume) / 100.0, p);
-    }
+    let label = fill(t.lbl_volume, &[&app.volume.to_string()]);
+    let inner = hud_panel(frame, area, &label, t.hint_volume, false, p);
+    parts::thin_bar(frame.buffer_mut(), Rect { height: 1, ..inner }, f64::from(app.volume) / 100.0, p);
 }
 
 // ── status / footer / help ───────────────────────────────────────────────────
@@ -382,21 +373,50 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
     }
 }
 
+fn footer_right(app: &App, p: &Palette) -> Line<'static> {
+    let t = app.lang.t();
+    let lang = if app.lang == Lang::Ru { "RU" } else { "EN" };
+    let mut spans = Vec::new();
+    if app.auto_download {
+        spans.push(Span::styled(format!("{} · ", t.auto_label), Style::default().fg(p.text)));
+    }
+    spans.push(Span::styled(format!("{lang} · v{} ", env!("CARGO_PKG_VERSION")), Style::default().fg(p.muted)));
+    Line::from(spans)
+}
+
+fn footer_height(app: &App, width: u16) -> u16 {
+    let needed = hint_line(app.lang.t().hint_footer, &PALETTE).width()
+        + text_width(app.lang.t().hint_playback) + footer_right(app, &PALETTE).width() + 6;
+    if app.sync.is_some() || needed > usize::from(width) { 2 } else { 1 }
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
+    if area.height == 0 { return; }
     let t = app.lang.t();
     let hints = hint_line(t.hint_footer, p);
     let hints_w = hints.width() as u16;
-    frame.render_widget(Paragraph::new(hints), area);
-
-    let lang = if app.lang == Lang::Ru { "RU" } else { "EN" };
-    let mut right_spans = Vec::new();
-    if app.auto_download {
-        right_spans.push(Span::styled(format!("{} · ", t.auto_label), Style::default().fg(p.text)));
-    }
-    right_spans.push(Span::styled(format!("{lang} · v{} ", env!("CARGO_PKG_VERSION")), Style::default().fg(p.muted)));
-    let right = Line::from(right_spans);
+    let right = footer_right(app, p);
     let right_w = right.width() as u16;
-    frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
+    let separate = footer_height(app, area.width) > 1;
+    let base = Rect { y: area.y + area.height - 1, height: 1, ..area };
+    let right_area = Rect { x: area.x + area.width.saturating_sub(right_w), width: right_w.min(area.width), ..base };
+    let left_area = Rect { width: hints_w.min(area.width.saturating_sub(right_area.width)), ..base };
+    frame.render_widget(Paragraph::new(hints), left_area);
+    frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), right_area);
+
+    // Three clear cells on each side of the centred playback controls.
+    // If the groups cannot fit, give playback its own row instead of
+    // overwriting the global shortcuts, language or download indicator.
+    let controls = if separate {
+        Rect { x: area.x + area.width.min(3), width: area.width.saturating_sub(6), height: 1, ..area }
+    } else {
+        Rect { x: area.x + hints_w + 3, width: area.width.saturating_sub(hints_w + right_w + 6), ..base }
+    };
+    let mut playback = hint_line(t.hint_playback, p);
+    playback.spans.remove(0);
+    playback.spans.pop();
+    frame.render_widget(Paragraph::new(playback).alignment(Alignment::Center), controls);
+    let area = base;
 
     // Sync progress lives in the gap between the hints and the language.
     let Some(sync) = &app.sync else { return };
@@ -421,6 +441,27 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
         spans = vec![Span::styled(format!("⇣ {:.0}%", frac * 100.0), Style::default().fg(p.text))];
     }
     frame.render_widget(Paragraph::new(Line::from(spans)).alignment(Alignment::Center), gap);
+}
+
+fn draw_link_dialog(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
+    let Some(dialog) = &app.link_dialog else { return };
+    let t = app.lang.t();
+    let width = area.width.min(78);
+    let height = area.height.min(11);
+    let popup = Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height);
+    frame.render_widget(Clear, popup);
+    let inner = framed_panel(frame, popup, t.link_title, t.link_hint, true, p);
+    let input_width = usize::from(inner.width.saturating_sub(2));
+    let input: String = dialog.input.chars().rev().take(input_width).collect::<Vec<_>>().into_iter().rev().collect();
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(t.link_prompt, Style::default().fg(p.text))),
+        Line::from(Span::styled(format!("> {input}▏"), Style::default().fg(p.accent))),
+        Line::from(""),
+    ];
+    if dialog.loading { lines.push(Line::from(Span::styled(t.buffering, Style::default().fg(p.muted)))); }
+    if let Some(error) = &dialog.error { lines.push(Line::from(Span::styled(error.clone(), Style::default().fg(p.text)))); }
+    frame.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }), inner);
 }
 
 fn draw_help(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
@@ -526,6 +567,78 @@ mod tests {
     }
 
     #[test]
+    fn focus_dot_moves_between_library_and_track_list() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('l'));
+        for lang in [Lang::Ru, Lang::En] {
+            a.lang = lang;
+            let list = super::quiet(&a.list.title(lang));
+            let library = super::quiet(lang.t().lbl_library);
+            a.focus = crate::app::Focus::List;
+            let active = render(&a, 130, 40);
+            assert!(active.contains(&format!("● {list}")));
+            assert!(!active.contains(&format!("● {library}")));
+            press(&mut a, KeyCode::Tab);
+            let inactive = render(&a, 130, 40);
+            assert!(inactive.contains(&format!("● {library}")));
+            assert!(!inactive.contains(&format!("● {list}")));
+            press(&mut a, KeyCode::Tab);
+            assert!(render(&a, 130, 40).contains(&format!("● {list}")));
+        }
+    }
+
+    #[test]
+    fn favourites_title_distinguishes_loaded_rows_from_the_total() {
+        let fake = FakeService::default().with_liked_tracks(350);
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        for lang in [Lang::Ru, Lang::En] {
+            a.lang = lang;
+            assert!(render(&a, 160, 40).contains("100/350"));
+        }
+    }
+
+    #[test]
+    fn track_action_shortcuts_share_the_list_bottom_border() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('l'));
+        for lang in [Lang::Ru, Lang::En] {
+            a.lang = lang;
+            for width in [30, 56, 120] {
+                let area = ratatui::layout::Rect::new(2, 2, width, 16);
+                let mut term = Terminal::new(TestBackend::new(width + 4, 20)).unwrap();
+                term.draw(|f| super::draw_list(f, area, &a, &PALETTE)).unwrap();
+                let buf = term.backend().buffer();
+                let y = area.y + area.height - 1;
+                assert_eq!(buf[(area.x, y)].symbol(), "╰");
+                assert_eq!(buf[(area.x + width - 1, y)].symbol(), "╯");
+                let footer: String = (area.x..area.x + width).map(|x| buf[(x, y)].symbol()).collect();
+                for key in ["W", "u", "O", "↑↓", "⏎"] { assert!(footer.contains(key), "missing {key} at width {width}: {footer}"); }
+                if width == 120 {
+                    for hint in lang.t().hint_track_actions { assert!(footer.contains(hint), "missing {hint}"); }
+                }
+                let below: String = (area.x..area.x + width).map(|x| buf[(x, y + 1)].symbol()).collect();
+                assert!(!below.contains('W'), "no extra shortcut row below the frame");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_link_modal_is_bilingual_and_survives_small_terminals() {
+        let mut a = app();
+        press(&mut a, KeyCode::Char('O'));
+        a.on_paste("https://music.yandex.ru/track/123");
+        for lang in [Lang::Ru, Lang::En] {
+            a.lang = lang;
+            let screen = render(&a, 130, 40);
+            assert!(screen.contains(lang.t().link_title));
+            assert!(screen.contains("https://music.yandex.ru/track/123"));
+            assert!(screen.contains(lang.t().link_hint));
+            for (w, h) in [(1, 1), (10, 5), (40, 12)] { render(&a, w, h); }
+        }
+    }
+
+    #[test]
     fn playlist_back_hint_is_on_the_bottom_left_in_both_languages() {
         let mut a = app();
         press_wait(&mut a, KeyCode::Char('p'));
@@ -539,14 +652,37 @@ mod tests {
                 let buf = term.backend().buffer();
                 let text = lang.t().hint_back_playlists;
                 let x = area.x + 2;
-                let y = area.y + area.height - 1;
-                let actual: String = (x..x + super::text_width(text) as u16).map(|x| buf[(x, y)].symbol()).collect();
-                assert_eq!(actual, text, "back hint at width {width}");
+                let row = (area.y..area.y + area.height).find(|&y| {
+                    (x..x + super::text_width(text) as u16).map(|x| buf[(x, y)].symbol()).collect::<String>() == text
+                }).expect("left-aligned back hint on the list's bottom border");
+                assert_eq!(buf[(area.x, row)].symbol(), "╰", "back hint shares the bottom border");
             }
             a.list = crate::app::ListKind::Likes;
             assert!(!render(&a, 130, 40).contains(lang.t().hint_back_playlists));
             a.list = crate::app::ListKind::Playlist("test".into());
         }
+    }
+
+    #[test]
+    fn artist_back_hint_only_appears_for_a_likes_origin() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Char('s'));
+        for lang in [Lang::Ru, Lang::En] {
+            a.lang = lang;
+            let mut term = Terminal::new(TestBackend::new(86, 18)).unwrap();
+            let area = ratatui::layout::Rect::new(3, 2, 80, 14);
+            term.draw(|f| super::draw_list(f, area, &a, &PALETTE)).unwrap();
+            let buf = term.backend().buffer();
+            let border: String = (area.x..area.x + area.width)
+                .map(|x| buf[(x, area.y + area.height - 1)].symbol()).collect();
+            assert!(border.contains(lang.t().hint_back_likes));
+        }
+        a.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert!(!render(&a, 130, 40).contains(a.lang.t().hint_back_likes));
+        press_wait(&mut a, KeyCode::Char('p'));
+        press_wait(&mut a, KeyCode::Char('s'));
+        assert!(!render(&a, 130, 40).contains(a.lang.t().hint_back_likes));
     }
 
     #[test]
@@ -566,7 +702,7 @@ mod tests {
         let mut a = app();
         let idle = render(&a, 130, 40);
         for needle in [
-            "Визуализатор", "Частоты", "16 кГц", "Уровень сигнала", "Данные трека", "Библиотека", "Прогресс трека",
+            "Визуализатор", "Частоты", "16 кГц", "Уровень сигнала", "Данные трека", "Библиотека",
             "Громкость: 70%", "нет сигнала", "Ничего не играет", "y a m u s i q", "▄█████▄", "справка", "╭",
         ] {
             assert!(idle.contains(needle), "missing {needle:?}");
@@ -583,6 +719,62 @@ mod tests {
         press(&mut a, KeyCode::Char('i'));
         let en = render(&a, 130, 40);
         assert!(en.contains("Library") && en.contains("Playing") && en.contains("Visualizer"));
+    }
+
+    #[test]
+    fn header_shows_current_track_icon_title_and_progress_in_three_rows() {
+        let mut a = playing_at(42);
+        press_wait(&mut a, KeyCode::Char('l'));
+        let row = |a: &App, y| {
+            let term = term(a, 130, 40);
+            let buf = term.backend().buffer();
+            (0..130).map(|x| buf[(x, y)].symbol()).collect::<String>()
+        };
+        assert!(row(&a, 0).contains('▶'));
+        assert!(row(&a, 1).contains("Static Bloom"), "header follows playback, not list selection");
+        assert!(!row(&a, 1).contains("Neon Harbor"));
+        let progress = row(&a, 2);
+        assert!(progress.contains("0:42"));
+        assert!(progress.contains("3:07"));
+        assert!(progress.contains('━') && progress.contains('─'));
+        assert!(!render(&a, 130, 40).contains("Прогресс трека"), "bottom progress block is removed");
+        press(&mut a, KeyCode::Char(' '));
+        assert!(row(&a, 0).contains('⏸'));
+        assert!(!row(&a, 0).contains('▶'));
+        a.queue[a.queue_pos.unwrap()].title = "Очень длинное название песни ".repeat(20);
+        assert!(row(&a, 1).contains('…'));
+        assert!(row(&a, 0).contains("Пауза"), "right-hand summary stays visible");
+        assert!(row(&a, 0).contains("y a m u s i q"), "brand stays visible");
+    }
+
+    #[test]
+    fn visualizer_centres_track_title_without_lyrics_but_not_when_hidden() {
+        let mut a = playing_at(10);
+        for width in [30, 80] {
+            for height in [12, 21] {
+                for state in 0..3 {
+                    a.lyrics = match state {
+                        0 => None, // still loading
+                        _ => Some(crate::app::LyricsView { track_id: a.current_track().unwrap().id.clone(),
+                            lyrics: if state == 1 { None } else { Some(crate::model::Lyrics::parse("")) }, scroll: 0.0, manual: None }),
+                    };
+                    let area = ratatui::layout::Rect::new(3, 2, width, height);
+                    for visible in [true, false] {
+                        a.show_lyrics = visible;
+                        let mut term = Terminal::new(TestBackend::new(width + 6, height + 4)).unwrap();
+                        term.draw(|f| super::visualizer::draw(f, area, &a, &PALETTE)).unwrap();
+                        let buf = term.backend().buffer();
+                        let inner = ratatui::layout::Rect::new(area.x + 2, area.y + 1, width - 4, height - 2);
+                        let text = "Static Bloom";
+                        let x = inner.x + (inner.width - super::text_width(text) as u16) / 2;
+                        let y = inner.y + inner.height / 2;
+                        let actual: String = (x..x + text.len() as u16).map(|x| buf[(x, y)].symbol()).collect();
+                        assert_eq!(actual == text, visible, "{width}×{height}, state {state}, visible {visible}");
+                        if visible { assert_eq!(buf[(x, y)].fg, PALETTE.accent); }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -659,6 +851,37 @@ mod tests {
     }
 
     #[test]
+    fn album_name_wraps_under_the_value_without_touching_neighbours() {
+        let mut a = playing_at(10);
+        a.queue[a.queue_pos.unwrap()].album = "Alpha Beta Gamma Delta Epsilon".into();
+        for lang in [Lang::Ru, Lang::En] {
+            a.lang = lang;
+            for width in [28, 36] {
+                let area = ratatui::layout::Rect::new(3, 2, width, 20);
+                let mut term = Terminal::new(TestBackend::new(width + 6, 24)).unwrap();
+                term.draw(|f| {
+                    f.render_widget(ratatui::widgets::Paragraph::new("X".repeat(24)).wrap(ratatui::widgets::Wrap { trim: false }), ratatui::layout::Rect::new(area.x + width, 0, 1, 24));
+                    super::parts::info(f, area, &a, &PALETTE);
+                }).unwrap();
+                let buf = term.backend().buffer();
+                let indent = lang.t().info_keys.iter().map(|key| super::text_width(key)).max().unwrap() + 4;
+                let lines: Vec<_> = (area.y..area.y + area.height).map(|y| (area.x..area.x + width).map(|x| buf[(x, y)].symbol()).collect::<String>()).collect();
+                let album_row = lines.iter().position(|line| line.contains(lang.t().info_keys[0])).unwrap();
+                assert!(lines[album_row].contains("Alpha"));
+                let mut album = String::new();
+                for line in &lines[album_row..] {
+                    if line.contains(lang.t().info_keys[1]) { break; }
+                    let value: String = line.chars().skip(indent).collect();
+                    if !album.is_empty() { album.push(' '); }
+                    album.push_str(value.trim());
+                }
+                assert_eq!(album, "Alpha Beta Gamma Delta Epsilon");
+                for y in 0..24 { assert_eq!(buf[(area.x + width, y)].symbol(), "X", "card must not overwrite its neighbour"); }
+            }
+        }
+    }
+
+    #[test]
     fn card_says_when_lossless_is_unavailable() {
         let mut a = playing_at(10);
         a.quality = Some("MP3 320".into());
@@ -701,6 +924,36 @@ mod tests {
         let resumed = render(&a, 130, 40);
         assert!(resumed.contains("▶"), "resuming brings ▶ back");
         assert!(!resumed.contains("⏸"));
+    }
+
+    #[test]
+    fn playback_footer_hints_are_centred_with_three_cell_gaps() {
+        let mut a = app();
+        for lang in [Lang::Ru, Lang::En] {
+            a.lang = lang;
+            for width in [80, 130, 180, 220] {
+                let height = super::footer_height(&a, width);
+                let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+                term.draw(|f| super::draw_footer(f, f.area(), &a, &PALETTE)).unwrap();
+                let buf = term.backend().buffer();
+                let controls_row: String = (0..width).map(|x| buf[(x, 0)].symbol()).collect();
+                assert!(controls_row.contains(lang.t().hint_playback), "missing controls at {width}: {controls_row}");
+                let (start, end) = if height == 1 {
+                    let left = super::hint_line(lang.t().hint_footer, &PALETTE).width() as u16;
+                    let right = width - super::footer_right(&a, &PALETTE).width() as u16;
+                    for x in left..left + 3 { assert_eq!(buf[(x, 0)].symbol(), " "); }
+                    for x in right - 3..right { assert_eq!(buf[(x, 0)].symbol(), " "); }
+                    (left + 3, right - 3)
+                } else { (3, width - 3) };
+                let occupied: Vec<_> = (start..end).filter(|&x| buf[(x, 0)].symbol() != " ").collect();
+                let left_pad = occupied[0] - start;
+                let right_pad = end - 1 - occupied[occupied.len() - 1];
+                assert!(left_pad.abs_diff(right_pad) <= 1, "playback controls are centred");
+                let screen = render(&a, width, 40);
+                assert!(!screen.contains("Прогресс трека") && !screen.contains("Track progress"));
+                assert!(!controls_row.contains("n/b"));
+            }
+        }
     }
 
     #[test]

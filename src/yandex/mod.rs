@@ -5,14 +5,14 @@ mod client;
 mod parse;
 
 use std::sync::{Arc, Mutex};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use crate::model::{Lyrics, Playlist, Quality, Stream, Track};
-use crate::service::{normalize, MusicService};
+use crate::service::{normalize, MusicService, RequestContext};
 use client::Client;
 
 /// `/tracks` accepts batches; keep requests modest.
@@ -21,12 +21,41 @@ const BATCH: usize = 100;
 const ARTIST_PAGE: usize = 100;
 const ARTIST_MAX_PAGES: usize = 10;
 
+#[derive(Default)]
+struct LikedCache {
+    ids: Option<HashSet<String>>,
+    revision: u64,
+    edits: HashMap<String, (u64, bool)>,
+}
+
+impl LikedCache {
+    fn set(&mut self, id: &str, liked: bool) {
+        self.revision += 1;
+        self.edits.insert(id.into(), (self.revision, liked));
+        if let Some(ids) = self.ids.as_mut() {
+            if liked { ids.insert(id.into()); } else { ids.remove(id); }
+        }
+    }
+
+    fn remember(&mut self, mut ids: HashSet<String>, observed: u64) -> HashSet<String> {
+        // Reads and writes now run on different workers. A snapshot that
+        // started earlier must not undo a mutation acknowledged meanwhile.
+        for (id, (revision, liked)) in &self.edits {
+            if *revision > observed {
+                if *liked { ids.insert(id.clone()); } else { ids.remove(id); }
+            }
+        }
+        self.ids = Some(ids.clone());
+        ids
+    }
+}
+
 pub struct YandexService {
     client: Client,
     uid: u64,
     name: String,
     /// Liked track ids, loaded lazily and kept in sync by `set_liked`.
-    liked: Arc<Mutex<Option<HashSet<String>>>>,
+    liked: Arc<Mutex<LikedCache>>,
 }
 
 impl YandexService {
@@ -48,19 +77,19 @@ impl YandexService {
             bail!("токен не привязан к аккаунту (нет uid)");
         };
         let login = account.get("login").and_then(Value::as_str).unwrap_or("?");
-        Ok(Self { client, uid, name: format!("YANDEX · {login}"), liked: Arc::new(Mutex::new(None)) })
+        Ok(Self { client, uid, name: format!("YANDEX · {login}"), liked: Arc::new(Mutex::new(LikedCache::default())) })
     }
 
     fn liked_ids(&self) -> Result<HashSet<String>> {
         // Take the hit, release the lock, then fetch: never hold it across a
         // network call, or a slow request stalls every other caller.
-        let hit = self.liked.lock().unwrap().clone();
-        if let Some(set) = hit {
-            return Ok(set);
-        }
+        let (hit, observed) = {
+            let cache = self.liked.lock().unwrap();
+            (cache.ids.clone(), cache.revision)
+        };
+        if let Some(set) = hit { return Ok(set); }
         let ids: HashSet<String> = self.like_refs()?.into_iter().map(|(id, _)| id).collect();
-        *self.liked.lock().unwrap() = Some(ids.clone());
-        Ok(ids)
+        Ok(self.liked.lock().unwrap().remember(ids, observed))
     }
 
     /// `(track_id, album_id)` of liked tracks, newest first.
@@ -75,13 +104,30 @@ impl YandexService {
 
     /// All liked tracks, newest first, resolved in batches by `fetch_tracks`.
     fn liked_tracks(&self) -> Result<Vec<Track>> {
-        let refs = self.like_refs()?;
-        *self.liked.lock().unwrap() = Some(refs.iter().map(|(id, _)| id.clone()).collect());
+        self.liked_tracks_with_context(&RequestContext::default())
+    }
+
+    fn liked_tracks_with_context(&self, context: &RequestContext) -> Result<Vec<Track>> {
+        context.check()?;
+        let observed = self.liked.lock().unwrap().revision;
+        let mut refs = self.like_refs()?;
+        context.check()?;
+        {
+            let mut cache = self.liked.lock().unwrap();
+            let original: HashSet<String> = refs.iter().map(|(id, _)| id.clone()).collect();
+            let ids = cache.remember(original.clone(), observed);
+            refs.retain(|(id, _)| ids.contains(id));
+            let mut added: Vec<_> = ids.difference(&original).cloned().collect();
+            added.sort_by_key(|id| std::cmp::Reverse(cache.edits.get(id).map_or(0, |e| e.0)));
+            let mut ordered: Vec<_> = added.into_iter().map(|id| (id, None)).collect();
+            ordered.extend(refs);
+            refs = ordered;
+        }
         let ids: Vec<String> = refs
             .into_iter()
             .map(|(id, album)| album.map_or(id.clone(), |a| format!("{id}:{a}")))
             .collect();
-        let mut tracks = self.fetch_tracks(&ids)?;
+        let mut tracks = self.fetch_tracks_with_context(&ids, context)?;
         for t in &mut tracks {
             t.liked = true;
         }
@@ -99,9 +145,15 @@ impl YandexService {
 
     /// Full track objects for `id` or `id:albumId` references.
     fn fetch_tracks(&self, refs: &[String]) -> Result<Vec<Track>> {
+        self.fetch_tracks_with_context(refs, &RequestContext::default())
+    }
+
+    fn fetch_tracks_with_context(&self, refs: &[String], context: &RequestContext) -> Result<Vec<Track>> {
         let mut out = Vec::with_capacity(refs.len());
         for chunk in refs.chunks(BATCH) {
+            context.check()?;
             let res = self.client.post_form("/tracks", &[("track-ids", &chunk.join(",")), ("with-positions", "false")])?;
+            context.check()?;
             out.extend(parse::tracks(res.as_array().into_iter().flatten()));
         }
         Ok(out)
@@ -217,8 +269,67 @@ impl MusicService for YandexService {
         Ok(self.mark(seq.iter().filter_map(|s| s.get("track").and_then(parse::track)).collect()))
     }
 
+    fn radio_batch(&self, station: &str, queue: Option<&str>) -> Result<crate::radio::Batch> {
+        let mut query = vec![("settings2", "true")];
+        if let Some(id) = queue { query.push(("queue", id)); }
+        let res = self.client.get(&format!("/rotor/station/{station}/tracks"), &query)?;
+        let tracks = res.get("sequence").and_then(Value::as_array).context("radio: no sequence")?;
+        Ok(crate::radio::Batch {
+            station: station.into(),
+            batch_id: res.get("batchId").and_then(Value::as_str).context("radio: no batchId")?.into(),
+            tracks: self.mark(tracks.iter().filter_map(|s| s.get("track").and_then(parse::track)).collect()),
+        })
+    }
+
+    fn radio_feedback(&self, event: &crate::radio::Feedback) -> Result<()> {
+        let mut body = serde_json::json!({"type": event.kind.api_name(), "timestamp": event.timestamp_ms});
+        if let Some(id) = &event.track_id { body["trackId"] = id.clone().into(); }
+        if matches!(event.kind, crate::radio::EventKind::RadioStarted) { body["from"] = "yamusiq".into(); }
+        if matches!(event.kind, crate::radio::EventKind::TrackFinished | crate::radio::EventKind::Skip) {
+            body["totalPlayedSeconds"] = event.played_seconds.into();
+        }
+        let res = self.client.post_json(&format!("/rotor/station/{}/feedback", event.station), &[("batch-id", &event.batch_id)], body)?;
+        if res.as_str() != Some("ok") { bail!("radio feedback was not acknowledged"); }
+        Ok(())
+    }
+
+    fn track(&self, id: &str) -> Result<Option<Track>> {
+        Ok(self.mark(self.fetch_tracks(&[id.to_string()])?).into_iter().next())
+    }
+
     fn likes(&self) -> Result<Vec<Track>> {
         self.liked_tracks()
+    }
+
+    fn likes_with_context(&self, _all: bool, context: &RequestContext) -> Result<Vec<Track>> {
+        self.liked_tracks_with_context(context)
+    }
+
+    fn likes_page(&self, refs: Option<&[String]>, offset: usize, context: &RequestContext) -> Result<crate::likes::Page> {
+        context.check()?;
+        let initial = refs.is_none();
+        let owned;
+        let refs = match refs {
+            Some(refs) => refs,
+            None => {
+                // Fetch the small reference list once, not all track details.
+                let observed = self.liked.lock().unwrap().revision;
+                let refs = self.like_refs()?;
+                context.check()?;
+                self.liked.lock().unwrap().remember(refs.iter().map(|(id, _)| id.clone()).collect(), observed);
+                let mut seen = HashSet::new();
+                owned = refs.into_iter().filter(|(id, _)| seen.insert(id.clone()))
+                    .map(|(id, album)| album.map_or(id.clone(), |album| format!("{id}:{album}"))).collect::<Vec<_>>();
+                &owned
+            }
+        };
+        let end = offset.saturating_add(crate::likes::PAGE_SIZE).min(refs.len());
+        let page = refs.get(offset..end).unwrap_or_default();
+        let mut resolved: HashMap<_, _> = self.fetch_tracks_with_context(page, context)?.into_iter().map(|track| (track.id.clone(), track)).collect();
+        let tracks = page.iter().filter_map(|id| resolved.remove(id.split(':').next().unwrap_or(id))).collect();
+        let tracks = self.mark(tracks);
+        context.check()?;
+        Ok(crate::likes::Page { tracks, refs: initial.then(|| refs.to_vec()), next: end })
     }
 
     fn likes_all(&self) -> Result<Vec<Track>> {
@@ -230,6 +341,11 @@ impl MusicService for YandexService {
     }
 
     fn artist_tracks(&self, track: &Track, all: bool) -> Result<Vec<Track>> {
+        self.artist_tracks_with_context(track, all, &RequestContext::default())
+    }
+
+    fn artist_tracks_with_context(&self, track: &Track, all: bool, context: &RequestContext) -> Result<Vec<Track>> {
+        context.check()?;
         let Some(id) = &track.artist_id else { return self.artist_by_name(&track.artist) };
         if !all {
             let res = self.client.get(&format!("/artists/{id}/brief-info"), &[])?;
@@ -241,10 +357,12 @@ impl MusicService for YandexService {
         // Every track, page by page (capped so huge catalogues stay responsive).
         let mut out = Vec::new();
         for page in 0..ARTIST_MAX_PAGES {
+            context.check()?;
             let res = self.client.get(
                 &format!("/artists/{id}/tracks"),
                 &[("page", &page.to_string()), ("page-size", &ARTIST_PAGE.to_string())],
             )?;
+            context.check()?;
             let items = res.get("tracks").and_then(Value::as_array).cloned().unwrap_or_default();
             let total = res.pointer("/pager/total").and_then(Value::as_u64).unwrap_or(0) as usize;
             let got = items.len();
@@ -258,13 +376,7 @@ impl MusicService for YandexService {
     fn set_liked(&mut self, track_id: &str, liked: bool) -> Result<()> {
         let action = if liked { "add-multiple" } else { "remove" };
         self.client.post_form(&format!("/users/{}/likes/tracks/{action}", self.uid), &[("track-ids", track_id)])?;
-        if let Some(set) = self.liked.lock().unwrap().as_mut() {
-            if liked {
-                set.insert(track_id.to_string());
-            } else {
-                set.remove(track_id);
-            }
-        }
+        self.liked.lock().unwrap().set(track_id, liked);
         Ok(())
     }
 
@@ -278,9 +390,15 @@ impl MusicService for YandexService {
     /// Best available source: lossless/AAC via `/get-file-info` (what the
     /// current apps use), falling back to MP3 via the legacy download-info.
     fn stream(&self, track_id: &str, quality: Quality) -> Result<Option<Stream>> {
+        self.stream_with_context(track_id, quality, &RequestContext::default())
+    }
+
+    fn stream_with_context(&self, track_id: &str, quality: Quality, context: &RequestContext) -> Result<Option<Stream>> {
+        context.check()?;
         // Any failure here (signature change, encrypted-only track) falls
         // through to the legacy path rather than breaking playback.
         let first = self.file_info_stream(track_id, quality).ok().flatten();
+        context.check()?;
         let wanted_best = matches!(quality, Quality::Lossless | Quality::High);
         let good_enough = first.as_ref().is_some_and(|s| s.is_lossless() || !wanted_best || s.bitrate_kbps >= 256);
         if good_enough {
@@ -295,11 +413,13 @@ impl MusicService for YandexService {
         {
             candidates.push(high);
         }
+        context.check()?;
         if candidates.iter().all(|c| c.bitrate_kbps < 320)
             && let Ok(legacy) = self.legacy_stream(track_id)
         {
             candidates.push(legacy);
         }
+        context.check()?;
         // Prefer higher bitrate; on a tie prefer AAC (more efficient) over MP3.
         let best = candidates.into_iter().max_by_key(|c| (c.bitrate_kbps, c.codec.starts_with("aac")));
         match best {
@@ -373,7 +493,7 @@ mod tests {
         });
         let service = YandexService {
             client: Client::for_test(base), uid: 1, name: "test".into(),
-            liked: Arc::new(Mutex::new(None)),
+            liked: Arc::new(Mutex::new(LikedCache::default())),
         };
         let tracks = service.likes().unwrap();
         assert_eq!(tracks.len(), 350);
@@ -381,6 +501,188 @@ mod tests {
         assert_eq!(tracks[349].id, "350");
         assert!(tracks.iter().all(|t| t.liked));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn radio_http_contract_preserves_station_batch_and_feedback_payload() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for n in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let result = match n {
+                    0 | 1 => {
+                        assert!(request.starts_with("GET /rotor/station/track:123/tracks?"), "{request}");
+                        assert!(request.contains("settings2=true"));
+                        if n == 1 { assert!(request.contains("queue=1")); }
+                        serde_json::json!({"batchId": format!("batch-{n}"), "sequence": [{"track": {"id": "1", "title": "Track"}}]})
+                    }
+                    2 => {
+                        assert!(request.starts_with("POST /rotor/station/track:123/feedback?batch-id=batch-0 "), "{request}");
+                        let body: Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(body["type"], "trackFinished");
+                        assert_eq!(body["timestamp"], 1234567890000_u64);
+                        assert_eq!(body["trackId"], "1");
+                        assert_eq!(body["totalPlayedSeconds"], 42.5);
+                        serde_json::json!("ok")
+                    }
+                    _ => {
+                        assert!(request.starts_with("POST /tracks "));
+                        assert!(String::from_utf8(body).unwrap().contains("track-ids=1%3A9"));
+                        serde_json::json!([{"id": "1", "title": "Track"}])
+                    }
+                };
+                let body = serde_json::json!({"result": result}).to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let service = YandexService { client: Client::for_test(base), uid: 1, name: "test".into(), liked: Arc::new(Mutex::new(LikedCache { ids: Some(HashSet::new()), ..LikedCache::default() })) };
+        let batch = service.radio_batch("track:123", None).unwrap();
+        assert_eq!(batch.batch_id, "batch-0");
+        assert_eq!(batch.station, "track:123");
+        assert_eq!(batch.tracks.len(), 1);
+        let next = service.radio_batch("track:123", Some("1")).unwrap();
+        assert_eq!(next.batch_id, "batch-1");
+        service.radio_feedback(&crate::radio::Feedback {
+            station: batch.station, batch_id: batch.batch_id, kind: crate::radio::EventKind::TrackFinished,
+            track_id: Some("1".into()), played_seconds: 42.5, timestamp_ms: 1234567890000,
+        }).unwrap();
+        assert_eq!(service.track("1:9").unwrap().unwrap().id, "1");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn favourites_pages_fetch_one_reference_list_and_only_requested_hundreds() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let server = std::thread::spawn(move || {
+            for request in 0..5 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut first_line = String::new();
+                reader.read_line(&mut first_line).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") { length = value.trim().parse().unwrap(); }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let result = if request == 0 {
+                    assert!(first_line.starts_with("GET /users/1/likes/tracks "));
+                    serde_json::json!({"library": {"tracks": (1..=350).map(|id| serde_json::json!({"id": id, "albumId": 9})).collect::<Vec<_>>()}})
+                } else {
+                    assert!(first_line.starts_with("POST /tracks "));
+                    let form: HashMap<_, _> = url::form_urlencoded::parse(&body).into_owned().collect();
+                    let start = (request - 1) * 100 + 1;
+                    let end = (request * 100).min(350);
+                    assert_eq!(form["track-ids"], (start..=end).map(|id| format!("{id}:9")).collect::<Vec<_>>().join(","));
+                    // Reverse the response and include an unavailable track to
+                    // verify ordering and the reference-based cursor.
+                    serde_json::json!((start..=end).rev().map(|id| serde_json::json!({"id": id, "title": format!("Track {id}"), "available": id != 150})).collect::<Vec<_>>())
+                };
+                seen.fetch_add(1, Ordering::SeqCst);
+                let body = serde_json::json!({"result": result}).to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let service = YandexService { client: Client::for_test(base), uid: 1, name: "test".into(), liked: Arc::default() };
+        let context = RequestContext::default();
+        let first = service.likes_page(None, 0, &context).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "only IDs and the first 100 detailed tracks");
+        assert_eq!(first.tracks.len(), 100);
+        assert_eq!(first.next, 100);
+        assert_eq!(first.tracks[0].id, "1");
+        let refs = first.refs.unwrap();
+        assert_eq!(refs.len(), 350);
+        let second = service.likes_page(Some(&refs), 100, &context).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "next page does not refetch the ID snapshot");
+        assert_eq!(second.tracks.len(), 99);
+        assert_eq!(second.next, 200);
+        assert!(second.refs.is_none());
+        assert_eq!(second.tracks[0].id, "101");
+        assert_eq!(second.tracks.last().unwrap().id, "200");
+        let third = service.likes_page(Some(&refs), second.next, &context).unwrap();
+        assert_eq!(third.tracks.len(), 100);
+        let last = service.likes_page(Some(&refs), third.next, &context).unwrap();
+        assert_eq!(last.tracks.len(), 50);
+        assert_eq!(last.next, 350);
+        assert_eq!(last.tracks.last().unwrap().id, "350");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_track_resolution_stops_before_the_next_http_batch() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let context = RequestContext::default();
+        let cancel = context.clone();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("POST /tracks "));
+            let mut length = 0;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" { break; }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") { length = value.trim().parse().unwrap(); }
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            // Simulate navigation while the first batch is on the wire.
+            cancel.cancel();
+            let body = serde_json::json!({"result": (1..=100).map(|id| serde_json::json!({"id": id, "title": "Track"})).collect::<Vec<_>>()}).to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let service = YandexService { client: Client::for_test(base), uid: 1, name: "test".into(), liked: Arc::default() };
+        let ids = (1..=350).map(|id| id.to_string()).collect::<Vec<_>>();
+        let error = service.fetch_tracks_with_context(&ids, &context).unwrap_err();
+        assert_eq!(error.to_string(), "request cancelled", "must stop locally, not try another HTTP batch");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_like_edits_survive_an_older_catalogue_snapshot() {
+        let mut cache = LikedCache::default();
+        let observed = cache.revision;
+        cache.set("1", false);
+        cache.set("3", true);
+        let ids = cache.remember(HashSet::from(["1".into(), "2".into()]), observed);
+        assert_eq!(ids, HashSet::from(["2".into(), "3".into()]));
+        // A later explicit refresh is authoritative for older edits too.
+        let current = cache.revision;
+        assert_eq!(cache.remember(HashSet::from(["2".into()]), current), HashSet::from(["2".into()]));
     }
 
     #[test]
@@ -401,6 +703,22 @@ mod live {
     fn service() -> YandexService {
         let token = crate::config::token().expect("no token configured");
         YandexService::connect(&token).expect("connect")
+    }
+
+    /// Read-only: no feedback or like mutations and no playback.
+    #[test]
+    #[ignore]
+    fn live_radio_batches_and_track_lookup_read_only() {
+        let s = service();
+        let batch = s.radio_batch(crate::radio::MY_WAVE, None).unwrap();
+        assert!(!batch.tracks.is_empty());
+        assert!(!batch.batch_id.is_empty());
+        let first = &batch.tracks[0];
+        assert_eq!(s.track(&first.id).unwrap().unwrap().id, first.id);
+        let seeded = s.radio_batch(&format!("track:{}", first.id), None).unwrap();
+        assert!(!seeded.tracks.is_empty());
+        assert!(!seeded.batch_id.is_empty());
+        println!("Read-only API: My Wave {} tracks; track radio {} tracks; batch IDs and track lookup OK", batch.tracks.len(), seeded.tracks.len());
     }
 
     #[test]

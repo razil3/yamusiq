@@ -82,5 +82,5 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
-            --generate-notes \
+            --notes "" \
             dist/*.tar.gz dist/SHA256SUMS

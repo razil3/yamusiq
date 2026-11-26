@@ -1,130 +1,285 @@
 # yamusiq
 
-Русская версия: [README.ru.md](README.ru.md).
+[English](README.en.md) · **Версия 1.2.0**
 
-![yamusiq — the player in the terminal](docs/preview-en.png)
+![yamusiq — плеер в терминале](docs/preview-ru.png)
 
-Keyboard-first Yandex Music terminal client for macOS on Apple Silicon and Intel, built with Rust and ratatui.
+Клиент Яндекс Музыки для терминала с управлением с клавиатуры. Rust и ratatui,
+macOS на Apple Silicon и Intel.
 
-## Current status
+## Возможности
 
-Fullscreen TUI for your Yandex Music account. It covers search, playlists, My Wave, likes (read / like / unlike), artist views (popular / all tracks), lyrics (synced LRC or plain text) and real playback in a selectable quality up to lossless FLAC. There is no offline demo: on first start yamusiq walks you through signing in.
+Полноэкранный плеер для вашего аккаунта Яндекс Музыки: поиск, плейлисты, «Моя
+волна», лайки (просмотр, лайк, снятие лайка), страницы исполнителя (популярное и
+все треки), текст песни (синхронизированный LRC или обычный) и воспроизведение в
+выбранном качестве вплоть до FLAC без потерь. Демо-режима нет: при первом запуске
+yamusiq проводит вас через вход в аккаунт.
 
-Code map:
+Карта исходников:
 
-- `src/service.rs` — `MusicService` trait (search, playlists, My Wave, likes, cached, artist tracks, like/unlike, lyrics, stream URL);
-- `src/login.rs` — first-run sign-in: instructions, opens the Yandex sign-in page, takes the key or the whole address-bar link without echoing it, verifies it and stores it with mode 600;
-- `src/yandex/` — `YandexService` for `api.music.yandex.net`. This is the unofficial API the official apps use. Includes request signing for lyrics and direct stream links;
-- `src/player.rs` — `Player` trait (play, pause, seek, analysis) and `SimPlayer`, a clock-only player used when there is no audio device and in tests;
-- `src/audio/` — `AudioPlayer`: FFmpeg decodes the stream to PCM, cpal plays it, and the output callback taps what reaches the speakers. A zero-padded Hann FFT turns that into 48 log-spaced bands, a level and a triggered waveform;
-- `src/model.rs` — tracks, playlists and lyrics, including an LRC parser (`[mm:ss.xx] line`) with plain-text fallback;
-- `src/app.rs` — state, key handling, queue, no-loop / track-loop / playlist-loop / random modes, lyric follow/scroll state;
-- `src/net.rs` — background network worker, independent request categories and stale-response handling;
-- `src/i18n.rs` — Russian (default) and English UI text, Russian plurals, ЙЦУКЕН→QWERTY hotkey mapping;
-- `src/ui/` — rendering: `mod.rs` (layout and panels), `visualizer.rs` (visualiser and lyrics overlay), `parts.rs` (header, bands, meters, card);
-- `src/testing/` — in-memory fake catalogue with original lyrics, compiled only for tests.
+- `src/service.rs` — трейт `MusicService` (поиск, плейлисты, волна, лайки, скачанное, треки исполнителя, лайк/анлайк, тексты, ссылка на поток);
+- `src/login.rs` — вход при первом запуске: инструкция, открытие страницы входа Яндекса, приём ключа или всей ссылки из адресной строки без отображения на экране, проверка и сохранение с правами 600;
+- `src/yandex/` — `YandexService` для `api.music.yandex.net`. Это неофициальный API, которым пользуются официальные приложения. Включает подпись запросов для текстов и прямых ссылок на поток;
+- `src/player.rs` — трейт `Player` (play, pause, seek, анализ) и `SimPlayer`, плеер только по часам, для тестов и машин без аудиоустройства;
+- `src/audio/` — `AudioPlayer`: FFmpeg декодирует поток в PCM, cpal выводит звук, а колбэк вывода снимает то, что реально доходит до динамиков. FFT с окном Ханна и дополнением нулями превращает это в 48 логарифмических полос, уровень и триггерную осциллограмму;
+- `src/model.rs` — треки, плейлисты и тексты песен, включая разбор LRC (`[mm:ss.xx] строка`) с откатом на обычный текст;
+- `src/app.rs` — состояние, обработка клавиш, очередь, режимы без повтора / повтор трека / повтор плейлиста / случайный порядок, следование за текстом и ручная прокрутка;
+- `src/net.rs` — шесть независимых очередей: воспроизведение, каталог, Волна, тексты, действия и загрузки; устаревшие запросы чтения пропускаются, пакетные загрузки поддерживают отмену;
+- `src/timing.rs` — необязательная диагностика задержек: только названия этапов и длительности;
+- `src/radio.rs` — пачки рекомендаций, события feedback и ID исходной пачки для каждого трека;
+- `src/links.rs` — публичные ссылки на треки, разбор ID и буфер обмена macOS;
+- `src/likes.rs` — метаданные страниц избранного и стабильные упорядоченные списки ID;
+- `src/i18n.rs` — русский (по умолчанию) и английский интерфейс, русские числительные, отображение ЙЦУКЕН → QWERTY;
+- `src/ui/` — отрисовка: `mod.rs` (раскладка и панели), `visualizer.rs` (визуализатор и оверлей текста), `parts.rs` (шапка, полосы, индикаторы, карточка);
+- `src/testing/` — поддельный каталог в памяти с оригинальными текстами, компилируется только для тестов.
 
-While a stream is loading the visualiser says "buffering", and with nothing playing it says "no signal". If the track has lyrics they scroll over the centre of the visualiser, with centred rows and the current line anchored at the vertical centre. Each line sits on the background colour only under its own glyphs, so the scene shows through between lines. Synced (LRC) lyrics follow the timestamps. Plain lyrics are spread over the track length. `[` / `]` scroll by hand, and the view returns to following playback 6 s after the last scroll.
+Пока поток загружается, визуализатор пишет `буферизация`, а когда ничего не
+играет — `нет сигнала`. Текст песни прокручивается по центру визуализатора:
+строки выровнены по середине, текущая строка находится на центральной горизонтали. Каждая строка ложится на фон только под своими
+глифами, поэтому сцена просвечивает между строк.
+Если текст загружается или отсутствует, по центру визуализатора показывается
+название трека. При ручном скрытии через `y` визуализатор остаётся без текста.
+В шапке между логотипом и правой сводкой всегда виден текущий трек в три строки:
+значок воспроизведения/паузы, название, затем текущая позиция, компактная полоса
+прогресса и длительность. Длинное название обрезается многоточием. Нижний блок
+«Прогресс трека» удалён. Подсказки воспроизведения находятся по центру нижней строки
+с отступами по три символа от соседних групп; в узком окне — на отдельной строке.
+Синхронизированный (LRC) текст следует за метками времени. Обычный текст
+распределяется по длине трека. `[` / `]` прокручивают вручную, а через 6 с после
+последней прокрутки вид возвращается к следованию за воспроизведением.
 
-Streams come from `/get-file-info` (the desktop app's endpoint, unencrypted `raw` transport), with the legacy MP3 `download-info` as a fallback. The track card shows the quality you are actually hearing.
+Потоки берутся из `/get-file-info` (эндпоинт десктопного приложения, незашифрованный
+транспорт `raw`), с откатом на устаревший MP3 `download-info`. В карточке трека
+показывается то качество, которое вы реально слышите.
 
-Network requests run in the background, keeping the interface responsive while lists, streams and lyrics load. Favourites load without a 300-track cap; restored favourites lists refresh automatically.
+Сетевые запросы выполняются в фоне: интерфейс продолжает работать во время
+загрузки списков, потоков и текстов. Избранное подгружается по 100 песен без
+ограничения в 300 треков. Новые сессии сохраняют страницы и курсоры; при
+восстановлении старой сессии без метаданных пагинации список обновляется.
 
-Known limit: My Wave loads one batch of tracks.
+«Моя волна» подкачивает новые пачки по мере исчерпания очереди, а не зацикливает
+первую. Feedback сообщает о начале, завершении и пропуске треков; лайки
+по-прежнему отправляются через API избранного.
 
-## Run
+## Запуск
 
 ```sh
-cargo run              # open the player (first start: sign in)
-cargo run -- --login   # sign in again / switch account, then open the player
-cargo run -- --logout  # forget the saved key
-cargo run -- --help    # all command-line options
+cargo run --release    # открыть плеер (первый запуск: вход)
+cargo run -- --login   # войти заново / сменить аккаунт, затем открыть плеер
+cargo run -- --logout  # забыть сохранённый ключ
+cargo run -- --help    # все ключи командной строки
 ```
 
-Command-line options:
+Ключи командной строки:
 
-| Option | What it does |
+| Ключ | Что делает |
 | --- | --- |
-| `--download-all` / `--dont-download-all` | Turn on/off (and remember) the mode where every track that starts playing is also saved locally; shown as `⇣ авто` in the footer |
-| `--download-fav` | Sync favourites without the UI: download every liked track not yet saved, with a progress bar, then exit (Ctrl-C stops; partial files are cleaned up on the next start) |
-| `--download-to-music` | Build a browsable copy of the saved tracks in `~/Music/yamusiq` (`<Artist>/<Artist> — <Title>`). It uses hard links, so no extra space; repeated runs add only what is new |
-| `--remove-all-downloaded` | Delete everything saved, after a confirmation; add `--yes` for scripts |
+| `--download-all` / `--dont-download-all` | Включить/выключить (и запомнить) режим, при котором каждый начатый трек ещё и сохраняется на диск; виден как `⇣ авто` в футере |
+| `--download-fav` | Синхронизировать избранное без интерфейса: скачать все лайкнутые треки, которых ещё нет, с индикатором прогресса и завершиться (Ctrl-C останавливает; недокачанные файлы удаляются при следующем запуске) |
+| `--download-to-music` | Собрать просматриваемую копию сохранённых треков в `~/Music/yamusiq` (`<Исполнитель>/<Исполнитель> — <Название>`). Используются жёсткие ссылки, так что места не занимает; повторные запуски добавляют только новое |
+| `--remove-all-downloaded` | Удалить всё сохранённое после подтверждения; добавьте `--yes` для скриптов |
 
-Requirements: `ffmpeg` in `PATH` (`brew install ffmpeg`) for playback.
+Требования: `ffmpeg` в `PATH` (`brew install ffmpeg`) для воспроизведения.
 
-### Signing in
+### Вход
 
-yamusiq needs your Yandex Music access key (an OAuth token). The first time you run it, or whenever the saved key stops working, it asks for one before opening the player:
+yamusiq нужен ключ доступа к Яндекс Музыке (OAuth-токен). При первом запуске
+или когда сохранённый ключ перестаёт работать, он спрашивает ключ до открытия
+плеера:
 
-1. It offers to open the Yandex sign-in page for the Yandex Music app: <https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d>.
-2. After you sign in, the browser lands on `https://music.yandex.ru/#access_token=…&token_type=bearer…`.
-3. Paste that whole address, or just the key after `access_token=`. Input is hidden. yamusiq extracts the key and checks it with Yandex.
-4. It saves the key to `~/.config/yamusiq/token`, readable only by you. Keys last about a year; when one expires, you will be asked again.
+1. Предлагает открыть страницу входа Яндекса для приложения Яндекс Музыки: <https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d>.
+2. После входа браузер оказывается на `https://music.yandex.ru/#access_token=…&token_type=bearer…`.
+3. Вставьте этот адрес целиком или только ключ после `access_token=`. Ввод не отображается. yamusiq извлекает ключ и проверяет его в Яндексе.
+4. Сохраняет ключ в `~/.config/yamusiq/token`, читаемый только вами. Ключи живут около года; когда истечёт, вас спросят снова.
 
-`YAMUSIQ_TOKEN` overrides the saved key. The key is never printed or logged. Without a terminal to ask in (for example in scripts), yamusiq prints where to get a key and exits.
+`YAMUSIQ_TOKEN` перекрывает сохранённый ключ. Ключ никогда не печатается и не
+пишется в логи. Без терминала, где можно спросить (например, в скриптах),
+yamusiq пишет, где взять ключ, и завершается.
 
-Controls:
+Управление:
 
-| Key | Action |
+| Клавиша | Действие |
 | --- | --- |
-| `f` | search (type, `Enter` run, `Esc` cancel) |
-| `p` / `w` / `l` / `d` | playlists / My Wave / likes / saved (local library) |
-| `s` / `S` | artist of the playing (or selected) track: popular tracks / all tracks |
-| `o` | stream quality: best (FLAC lossless) → high (AAC 256) → normal (AAC 192) → data saver (HE-AAC 64); applies immediately and is remembered |
-| `j` `k` / `↑` `↓`, `Tab`, `Enter` | move, switch focus, open / play |
-| `Space`, `n`, `b` | play-pause, next, previous |
-| `←` / `→` | seek −5 s / +5 s |
-| `y` | show / hide lyrics |
-| `[` / `]` | scroll lyrics manually |
-| `L` | like / unlike |
-| `D` | save the track to the local library; press again to delete the saved file |
-| `⌥⇧D` | sync all favourites into the library (again to stop); progress bar in the bottom line |
-| `a` | no loop: stop at the end of the queue |
-| `c` | cycle: no loop → loop track → playlist loop (the entire queue) |
-| `r` | random order |
-| `Shift+←` | return from a playlist to the playlists list, preserving selection and playback |
-| `+` `-`, `v` | volume, visualiser motion on/off |
-| `i` | interface language RU ↔ EN |
-| `?` / `h` / `F1` | help overlay |
-| `q` / `Esc` / `Ctrl-C` | quit |
+| `f` | поиск (введите, `Enter` — запуск, `Esc` — отмена) |
+| `p` / `w` / `l` / `d` | плейлисты / моя волна / лайки / сохранённое (локальная медиатека) |
+| `W` | запустить Волну по выделенному треку (вне списка — по играющему) |
+| `u` | скопировать публичную ссылку на трек в буфер обмена macOS |
+| `O` (Shift+o) | модальное окно: вставить ссылку или ID, `Enter` — открыть и играть, `Esc` — отменить |
+| `s` / `S` | исполнитель выделенного трека (если песни в списке не выбрано — играющего): популярное / все треки |
+| `o` | качество потока: best (FLAC без потерь) → high (AAC 256) → normal (AAC 192) → data saver (HE-AAC 64); применяется сразу и запоминается |
+| `j` `k` / `↑` `↓`, `Tab`, `Enter` | перемещение, смена фокуса, открыть / играть |
+| `Space`, `n`, `b` | пауза-воспроизведение, следующий, предыдущий |
+| `←` / `→` | перемотка −5 с / +5 с |
+| `y` | показать / скрыть текст |
+| `[` / `]` | ручная прокрутка текста |
+| `L` | лайк / снять лайк выделенному треку; играющему — только если нет выделенной строки с треком |
+| `D` | сохранить трек в локальную медиатеку; нажать снова — удалить сохранённый файл |
+| `⌥⇧D` | синхронизировать всё избранное в медиатеку (снова — остановить); индикатор прогресса в нижней строке |
+| `a` | без повтора: остановиться в конце очереди |
+| `c` | переключить: без повтора → зациклить трек → повтор плейлиста (всей очереди) |
+| `r` | случайный порядок |
+| `Shift+←` | из плейлиста к списку плейлистов; от исполнителя, открытого из Избранного, — обратно в Избранное, сохраняя выделение и воспроизведение |
+| `+` `-`, `v` | громкость, движение визуализатора вкл/выкл |
+| `i` | язык интерфейса RU ↔ EN |
+| `?` / `h` / `F1` | оверлей справки |
+| `q` / `Esc` / `Ctrl-C` | выход |
 
-Playlist loop repeats the entire playback queue, including favourites and search results. Manual next/previous commands still change tracks when single-track repeat is enabled.
+Повтор плейлиста зацикливает всю очередь воспроизведения, включая Избранное
+и результаты поиска. Ручные команды «следующий/предыдущий» переключают песни
+и при зацикленном треке.
 
-Hotkeys also work with the Russian keyboard layout active (e.g. `а` = `f`, `ц` = `w`, `х` = `[`); search input is taken verbatim, case-insensitive, with «ё» = «е».
+Горячие клавиши работают и при активной русской раскладке (например, `а` = `f`,
+`ц` = `w`, `х` = `[`); ввод в поиске принимается как есть, без учёта регистра,
+с «ё» = «е».
 
-Local library: `D` saves a track as a tagged audio file under `~/Library/yamusiq/<Artist>/<Artist> — <Title>.<ext>`. It is deliberately kept out of `~/Music`; set `YAMUSIQ_LIBRARY` to change the location. A library from earlier versions in `~/Music/yamusiq` is moved there on first start. The file is saved in the selected quality and remuxed without re-encoding, so FLAC stays bit-exact. Saved tracks show `⇣` next to the title, appear under "Saved" (`d`) and play from disk, which is instant and works offline. The index is `library.json` in the library folder. Lossless favourites take about 25 MB per track on average, so check the size before a full sync of a large Favourites list.
+`Shift+L` во всех списках меняет сердечко выделенного трека; играющий трек
+используется только при отсутствии выделенной строки с треком. В Избранном это работает без удаления строки,
+перезагрузки списка и сброса выделения. Список обновляется при явном повторном
+открытии Избранного. Если запрос завершился ошибкой, сердечко возвращается на месте.
 
-While running, yamusiq sets the window title to "yamusiq · музыка в консоли" (or "yamusiq · music in the console" in English) and restores your previous title on exit. FFmpeg runs as an orphan process: it is not a descendant of yamusiq and has no controlling terminal, so Terminal does not list it ("yamusiq ▸ ffmpeg"). yamusiq stops it itself. Terminal.app still adds the working folder, the process name and the window size by itself. To turn them off, open Settings → Profiles → Window (and Tab) → Title and untick "Working directory or document", "Active process name" and "Dimensions".
+Локальная медиатека: `D` сохраняет трек как аудиофайл с тегами в
+`~/Library/yamusiq/<Исполнитель>/<Исполнитель> — <Название>.<ext>`. Намеренно вне
+`~/Music`; `YAMUSIQ_LIBRARY` меняет расположение. Медиатека прежних версий из
+`~/Music/yamusiq` переносится туда при первом запуске. Файл сохраняется в
+выбранном качестве и пересобирается контейнером без перекодирования, поэтому FLAC
+остаётся бит-в-бит. Сохранённые треки помечаются `⇣` рядом с названием, появляются
+в разделе «Сохранённое» (`d`) и играют с диска — мгновенно и офлайн. Индекс —
+`library.json` в папке медиатеки. Без потерь избранное весит в среднем около
+25 МБ на трек, так что прикиньте размер перед полной синхронизацией большого
+списка «Мне нравится».
 
-`⌥⇧D` arrives as Alt+Shift+D when the terminal sends Option as Meta (iTerm2: Profiles → Keys → "Option key: Esc+"). Without Meta, macOS sends `Î` on the US layout; yamusiq accepts that too.
+Пока работает, yamusiq задаёт заголовок окна «yamusiq · музыка в консоли» (или
+«yamusiq · music in the console» на английском) и на выходе возвращает прежний.
+FFmpeg запускается как сиротский процесс: он не является потомком yamusiq и не
+имеет управляющего терминала, поэтому Terminal не показывает его («yamusiq ▸
+ffmpeg»). yamusiq останавливает его сам. Terminal.app всё равно добавляет рабочую
+папку, имя процесса и размер окна. Чтобы это отключить, откройте Settings →
+Profiles → Window (и Tab) → Title и снимите «Working directory or document»,
+«Active process name» и «Dimensions».
 
-On exit yamusiq also saves the session to `~/.config/yamusiq/session.json`: the open list with its tracks, the cursor, the queue, the current track and its position, the playback mode and the volume. On the next launch the same account picks up there. The track reopens paused at the same second with a fresh stream link, and `Space` plays it.
+`⌥⇧D` приходит как Alt+Shift+D, если терминал передаёт Option как Meta (iTerm2:
+Profiles → Keys → «Option key: Esc+»). Без Meta macOS присылает `Î` на
+американской раскладке; yamusiq принимает и это.
 
-The language and stream quality are saved on exit to `~/.config/yamusiq/config.json` (or `$XDG_CONFIG_HOME/yamusiq/config.json`); `YAMUSIQ_LANG=ru|en` overrides it. The interface starts in Russian by default.
+На выходе yamusiq сохраняет сессию в `~/.config/yamusiq/session.json`: открытый
+список с его треками, курсор, очередь, текущий трек и его позицию, режим
+воспроизведения и громкость. При следующем запуске тот же аккаунт продолжает
+оттуда. Трек открывается на паузе на той же секунде со свежей ссылкой на поток,
+`Space` запускает.
 
-Colours are 24-bit: use a truecolor terminal (iTerm2, Ghostty, WezTerm, Kitty, Alacritty).
+Язык и качество потока сохраняются на выходе в `~/.config/yamusiq/config.json`
+(или `$XDG_CONFIG_HOME/yamusiq/config.json`); `YAMUSIQ_LANG=ru|en` перекрывает.
+Интерфейс стартует на русском.
 
-Tests: `cargo test`. Live API checks (need a token): `cargo test live_ -- --ignored --nocapture`. Text dump of the rendered screen: `cargo test dump_screen -- --ignored --nocapture` (`YAMUSIQ_DUMP_AT=<seconds>` picks the playback position).
+Цвета 24-битные: нужен терминал с truecolor (iTerm2, Ghostty, WezTerm, Kitty,
+Alacritty). При входе в плеер yamusiq задаёт фону терминала тот же цвет
+`#111113` через OSC 11: в поддерживающих терминалах внутренние поля окна
+сливаются с интерфейсом без изменения отступов содержимого. При выходе или
+панике фон сбрасывается к цвету профиля через OSC 111. Поддержка зависит от
+терминала; если поля остаются другого цвета, задайте в профиле фон `#111113`
+вручную. В стандартном Terminal.app на macOS Tahoe автоматическая смена фона
+полей не работает: цвет фона профиля нужно установить вручную в RGB **17, 17, 19**
+с непрозрачностью 100%.
 
-## Install
+Тесты: `cargo test --locked`; проверки стиля: `cargo clippy --locked --all-targets -- -D warnings`.
+Живые проверки API не входят в обычный запуск тестов и требуют отдельного осознанного запуска. Текстовый дамп отрисованного экрана: `cargo test dump_screen -- --ignored --nocapture` (`YAMUSIQ_DUMP_AT=<секунды>` задаёт позицию воспроизведения).
 
-Download the archive for your Mac and put the binary on your PATH:
+## Установка
+
+Для воспроизведения нужен FFmpeg:
+
+```sh
+brew install ffmpeg
+```
+
+После публикации 1.2.0 на crates.io можно установить плеер из исходников
+(нужен Rust с поддержкой edition 2024):
+
+```sh
+cargo install yamusiq --version 1.2.0 --locked
+```
+
+
+Скачайте архив под ваш Mac и положите бинарник в `PATH`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/razil3/yamusiq/master/scripts/install.sh | sh
 ```
 
-The script picks `arm64` or `x86_64`, verifies the archive against `SHA256SUMS`
-and installs to `/usr/local/bin`, or `~/.local/bin` when the former is not
-writable. Pin a published release with `YAMUSIQ_VERSION=vX.Y.Z`. `ffmpeg` is still needed
-for playback.
+Скрипт выбирает `arm64` или `x86_64`, сверяет архив с `SHA256SUMS` и ставит
+бинарник в `/usr/local/bin`, а если туда нет прав — в `~/.local/bin`.
+Закрепить опубликованный релиз можно через `YAMUSIQ_VERSION=vX.Y.Z`. Для воспроизведения
+по-прежнему нужен `ffmpeg`.
 
-## Next
+## Постраничная загрузка Избранного
 
-`1.2.0` makes My Wave real: batches are pumped as the queue runs out, playback reports back to the
-rotor station (started, finished, skipped, liked), and the wave moves forward
-instead of looping over one batch.
+При открытии Избранного один раз получается небольшой полный список ID,
+а подробные данные загружаются только для первых **100 песен**. Когда выделение
+или воспроизведение доходит до **90-й песни**, в фоне запрашиваются следующие
+100; затем пороги — 190, 290 и так далее. Страницы дописываются в конец без
+сброса выделения, воспроизведения и сердечек уже показанных строк. Заголовок
+показывает число загруженных строк и общее количество: **загружено 100/4179**.
+Недоступные треки пропускаются, поэтому в странице может быть меньше 100
+проигрываемых песен; курсор всё равно учитывает все обработанные ID.
 
-## Platform
+Если следующая страница задержалась, плеер ждёт её, а не останавливается и не
+зацикливает загруженную часть. Подкачка очереди Избранного продолжается и при
+просмотре другого раздела. Повторное открытие Избранного получает новый список
+ID, не заменяя уже играющую очередь. Страницы и оба курсора сохраняются в
+сессии. Полная синхронизация (`⌥⇧D` / `--download-fav`) по-прежнему обрабатывает
+**всё** Избранное независимо от страниц интерфейса.
 
-macOS on Apple Silicon and Intel (CoreAudio via cpal). Releases include arm64, x86_64 and Universal binaries. FFmpeg is required for playback.
+Новые действия (`W`, `u`, `O`) находятся на нижней линии рамки списка вместе
+с навигацией. На узких панелях подписи сокращаются; полное описание есть в F1.
+
+## Волна и обмен треками
+
+`w` загружает «Мою волну»; выберите трек и нажмите `Enter` для воспроизведения.
+`W` сразу запускает станцию по выделенному треку. Первая пачка показывается
+и доступна для воспроизведения сразу после ответа сервиса; затем оба списка
+добираются до **15 уникальных треков** в фоне, не задерживая запуск музыки.
+При переходе выделения на предпоследнюю строку запрашиваются **ещё пять**;
+курсор и текущее воспроизведение не меняются. Подкачка по ходу прослушивания
+тоже сохраняется: когда впереди остаётся три трека или меньше. Порядок
+рекомендаций сохраняется. Если Яндекс повторяет пачку или не отдаёт достаточно
+новых песен, показываются доступные: число попыток ограничено, дубли удаляются,
+прокрутка не отправляет фиктивных событий прослушивания или пропуска. Зацикливание трека работает; повтор плейлиста и случайный порядок
+не зацикливают и не перемешивают очередь Волны. При пустой пачке или ошибке
+доигрываются уже загруженные треки, затем плеер ждёт новые, повторяя запрос
+через 10 секунд. Переход между разделами не останавливает Волну; запуск трека
+из другого списка или открытие присланного трека заменяет очередь Волны.
+
+`u` и `O` — отдельные функции обмена треками, а не управление Волной.
+В списке копируется ссылка на выделенный трек, вне списка — на играющий.
+Модальное окно принимает числовой ID, `trackId:albumId` или публичную ссылку
+Яндекс Музыки: `https://music.yandex.ru/album/ALBUM/track/TRACK` либо
+`https://music.yandex.ru/track/TRACK`. Вставка не выполняет команды и не
+загружает произвольные URL. До нахождения нового трека текущая музыка
+продолжает играть. После успешного поиска запускается очередь из одного трека.
+
+## Диагностика задержек
+
+У воспроизведения своя очередь: оно не ждёт загрузки каталога, текстов,
+feedback Волны и скачиваний. Устаревшие запросы чтения пропускаются до запуска;
+пакетные загрузки избранного, страниц исполнителя и рекомендаций проверяют
+отмену между запросами. Уже выполняющийся HTTP-запрос ограничен прежним
+таймаутом. Запросы Волны и feedback выполняются по порядку в одной очереди;
+изменения лайков — последовательно в очереди действий.
+
+Для записи измерений в файл, без вывода поверх интерфейса:
+
+```sh
+YAMUSIQ_TIMINGS="$HOME/Library/Logs/yamusiq-timings.log" ./dist/yamusiq-1.2.0-universal
+```
+
+Записываются ожидание в очереди (`playback.queue`, `catalogue.queue` и др.),
+длительность запроса (`playback.request` и др.), время до передачи источника
+плееру (`playback.ready`) и запуск декодера до первых PCM-сэмплов в буфере
+(`audio.first_pcm`). Только названия этапов и миллисекунды — без ID треков,
+имени аккаунта, URL и токенов. Без этой переменной файл не создаётся.
+Это отдельные этапы, а не сквозной замер до появления слышимого звука.
+
+## Платформа
+
+macOS на Apple Silicon и Intel (CoreAudio через cpal). Для релизов собираются
+arm64, x86_64 и Universal-бинарники. Для воспроизведения нужен FFmpeg.
