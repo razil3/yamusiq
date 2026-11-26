@@ -4,7 +4,7 @@
 
 ![yamusiq — the player in the terminal](docs/preview-en.png)
 
-Keyboard-first Yandex Music terminal client for macOS arm64, built with Rust and ratatui.
+Keyboard-first Yandex Music terminal client for macOS on Apple Silicon and Intel, built with Rust and ratatui.
 
 ## Current status
 
@@ -18,16 +18,19 @@ Code map:
 - `src/player.rs` — `Player` trait (play, pause, seek, analysis) and `SimPlayer`, a clock-only player used when there is no audio device and in tests;
 - `src/audio/` — `AudioPlayer`: FFmpeg decodes the stream to PCM, cpal plays it, and the output callback taps what reaches the speakers. A zero-padded Hann FFT turns that into 48 log-spaced bands, a level and a triggered waveform;
 - `src/model.rs` — tracks, playlists and lyrics, including an LRC parser (`[mm:ss.xx] line`) with plain-text fallback;
-- `src/app.rs` — state, key handling, queue and ALL / LOOP / RAND logic, lyric follow/scroll state;
+- `src/app.rs` — state, key handling, queue, no-loop / track-loop / playlist-loop / random modes, lyric follow/scroll state;
+- `src/net.rs` — background network worker, independent request categories and stale-response handling;
 - `src/i18n.rs` — Russian (default) and English UI text, Russian plurals, ЙЦУКЕН→QWERTY hotkey mapping;
 - `src/ui/` — rendering: `mod.rs` (layout and panels), `visualizer.rs` (visualiser and lyrics overlay), `parts.rs` (header, bands, meters, card);
 - `src/testing/` — in-memory fake catalogue with original lyrics, compiled only for tests.
 
-While a stream is loading the visualiser says "buffering", and with nothing playing it says "no signal". If the track has lyrics they rise line by line on the right, over the visualiser. Each line sits on the background colour only under its own glyphs, so the scene shows through between lines. Synced (LRC) lyrics follow the timestamps. Plain lyrics are spread over the track length. `[` / `]` scroll by hand, and the view returns to following playback 6 s after the last scroll.
+While a stream is loading the visualiser says "buffering", and with nothing playing it says "no signal". If the track has lyrics they scroll over the centre of the visualiser, with centred rows and the current line anchored at the vertical centre. Each line sits on the background colour only under its own glyphs, so the scene shows through between lines. Synced (LRC) lyrics follow the timestamps. Plain lyrics are spread over the track length. `[` / `]` scroll by hand, and the view returns to following playback 6 s after the last scroll.
 
 Streams come from `/get-file-info` (the desktop app's endpoint, unencrypted `raw` transport), with the legacy MP3 `download-info` as a fallback. The track card shows the quality you are actually hearing.
 
-Known limits: network calls run on the UI thread, so the screen pauses briefly while a list or stream loads. My Wave loads one batch of tracks.
+Network requests run in the background, keeping the interface responsive while lists, streams and lyrics load. Favourites load without a 300-track cap; restored favourites lists refresh automatically.
+
+Known limit: My Wave loads one batch of tracks.
 
 ## Run
 
@@ -85,6 +88,8 @@ Controls:
 | `?` / `h` / `F1` | help overlay |
 | `q` / `Esc` / `Ctrl-C` | quit |
 
+Playlist loop repeats the entire playback queue, including favourites and search results. Manual next/previous commands still change tracks when single-track repeat is enabled.
+
 Hotkeys also work with the Russian keyboard layout active (e.g. `а` = `f`, `ц` = `w`, `х` = `[`); search input is taken verbatim, case-insensitive, with «ё» = «е».
 
 Local library: `D` saves a track as a tagged audio file under `~/Library/yamusiq/<Artist>/<Artist> — <Title>.<ext>`. It is deliberately kept out of `~/Music`; set `YAMUSIQ_LIBRARY` to change the location. A library from earlier versions in `~/Music/yamusiq` is moved there on first start. The file is saved in the selected quality and remuxed without re-encoding, so FLAC stays bit-exact. Saved tracks show `⇣` next to the title, appear under "Saved" (`d`) and play from disk, which is instant and works offline. The index is `library.json` in the library folder. Lossless favourites take about 25 MB per track on average, so check the size before a full sync of a large Favourites list.
@@ -111,17 +116,15 @@ curl -fsSL https://raw.githubusercontent.com/razil3/yamusiq/master/scripts/insta
 
 The script picks `arm64` or `x86_64`, verifies the archive against `SHA256SUMS`
 and installs to `/usr/local/bin`, or `~/.local/bin` when the former is not
-writable. Pin a release with `YAMUSIQ_VERSION=v1.0.0`. `ffmpeg` is still needed
+writable. Pin a published release with `YAMUSIQ_VERSION=vX.Y.Z`. `ffmpeg` is still needed
 for playback.
 
 ## Next
 
-`1.1.0` moves network work off the UI thread, so lists and streams load behind a
-`buffering` state instead of freezing the screen. `1.2.0` then makes My Wave
-real: batches are pumped as the queue runs out, playback reports back to the
+`1.2.0` makes My Wave real: batches are pumped as the queue runs out, playback reports back to the
 rotor station (started, finished, skipped, liked), and the wave moves forward
 instead of looping over one batch.
 
 ## Platform
 
-Development target: macOS on Apple Silicon (CoreAudio via cpal). FFmpeg is required for playback.
+macOS on Apple Silicon and Intel (CoreAudio via cpal). Releases include arm64, x86_64 and Universal binaries. FFmpeg is required for playback.
