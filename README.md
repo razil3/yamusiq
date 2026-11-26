@@ -113,8 +113,8 @@ for playback.
 
 ## Next
 
-`0.2.0` moves network work off the UI thread, so lists and streams load behind a
-`buffering` state instead of freezing the screen. `0.2.1` then makes My Wave
+`1.1.0` moves network work off the UI thread, so lists and streams load behind a
+`buffering` state instead of freezing the screen. `1.2.0` then makes My Wave
 real: batches are pumped as the queue runs out, playback reports back to the
 rotor station (started, finished, skipped, liked), and the wave moves forward
 instead of looping over one batch.
