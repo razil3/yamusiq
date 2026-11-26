@@ -42,9 +42,9 @@ rm -rf "$stage"
 rm -f "$OUT/$NAME-$VERSION-universal"
 echo "packed $OUT/$NAME-$VERSION-universal.tar.gz"
 
-# Checksums last, so a partial run never leaves a stale file listed.
+# Only include this release, even when dist still holds older archives.
 : > "$OUT/SHA256SUMS"
-for f in "$OUT"/*.tar.gz; do
-    (cd "$OUT" && shasum -a 256 "$(basename "$f")") >> "$OUT/SHA256SUMS"
+for arch in arm64 x86_64 universal; do
+    (cd "$OUT" && shasum -a 256 "$NAME-$VERSION-$arch.tar.gz") >> "$OUT/SHA256SUMS"
 done
 echo "wrote $OUT/SHA256SUMS"
