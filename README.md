@@ -76,7 +76,10 @@ Controls:
 | `L` | like / unlike |
 | `D` | save the track to the local library; press again to delete the saved file |
 | `⌥⇧D` | sync all favourites into the library (again to stop); progress bar in the bottom line |
-| `a` / `c` / `r` | mode: play all / loop track / random |
+| `a` | no loop: stop at the end of the queue |
+| `c` | cycle: no loop → loop track → playlist loop (the entire queue) |
+| `r` | random order |
+| `Shift+←` | return from a playlist to the playlists list, preserving selection and playback |
 | `+` `-`, `v` | volume, visualiser motion on/off |
 | `i` | interface language RU ↔ EN |
 | `?` / `h` / `F1` | help overlay |

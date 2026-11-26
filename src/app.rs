@@ -38,6 +38,7 @@ pub enum PlaybackMode {
     All,
     Repeat,
     Random,
+    PlaylistLoop,
 }
 
 impl PlaybackMode {
@@ -227,8 +228,6 @@ impl Rng {
     }
 }
 
-/// Pick the next queue index. `manual` is true when the user pressed "next",
-/// in which case LOOP still advances instead of repeating the same track.
 /// Which list a job will fill, for the footer and for the status line.
 fn job_kind(job: &Job) -> ListKind {
     match job {
@@ -253,11 +252,14 @@ fn job_kind(job: &Job) -> ListKind {
     }
 }
 
+/// Natural completion stops at the end without a loop; manual next still
+/// advances (and wraps) even when the current track is set to repeat.
 pub fn next_index(mode: PlaybackMode, len: usize, current: usize, manual: bool, rng: &mut Rng) -> Option<usize> {
     if len == 0 {
         return None;
     }
     match mode {
+        PlaybackMode::All if !manual && current + 1 >= len => None,
         PlaybackMode::Repeat if !manual => Some(current),
         PlaybackMode::Random if len > 1 => {
             let step = 1 + rng.below(len - 1);
@@ -301,6 +303,8 @@ pub struct App {
     pub list: ListKind,
     pub entries: Vec<Entry>,
     pub selected: usize,
+    playlist_parent: Option<(Vec<Entry>, usize)>,
+    playlist_return_title: Option<String>,
     pub queue: Vec<Track>,
     pub queue_pos: Option<usize>,
     pub status: Status,
@@ -365,6 +369,8 @@ impl App {
             list: ListKind::Overview,
             entries: Vec::new(),
             selected: 0,
+            playlist_parent: None,
+            playlist_return_title: None,
             queue: Vec::new(),
             queue_pos: None,
             status: Status::Ready,
@@ -440,7 +446,14 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('+') | KeyCode::Char('=') => self.change_volume(5),
             KeyCode::Char('-') => self.change_volume(-5),
-            KeyCode::Char('c') => self.set_mode(PlaybackMode::Repeat),
+            KeyCode::Char('c') => {
+                let mode = match self.mode {
+                    PlaybackMode::All | PlaybackMode::Random => PlaybackMode::Repeat,
+                    PlaybackMode::Repeat => PlaybackMode::PlaylistLoop,
+                    PlaybackMode::PlaylistLoop => PlaybackMode::All,
+                };
+                self.set_mode(mode);
+            }
             KeyCode::Char('a') => self.set_mode(PlaybackMode::All),
             KeyCode::Char('r') => self.set_mode(PlaybackMode::Random),
             KeyCode::Char('v') => self.visualizer = !self.visualizer,
@@ -449,6 +462,7 @@ impl App {
                 self.status = Status::Lyrics(self.show_lyrics);
             }
             KeyCode::Char('o') => self.cycle_quality(),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => self.back_to_playlists(),
             KeyCode::Left => self.seek_by(-5),
             KeyCode::Right => self.seek_by(5),
             KeyCode::Char('[') => self.scroll_lyrics(-1.0),
@@ -531,6 +545,7 @@ impl App {
             Focus::Nav => self.open_section(Section::ALL[self.section]),
             Focus::List => match self.entries.get(self.selected).cloned() {
                 Some(Entry::Playlist(p)) => {
+                    self.playlist_parent = Some((self.entries.clone(), self.selected));
                     self.await_job(Job::PlaylistTracks { id: p.id.clone(), title: p.title.clone() });
                 }
                 Some(Entry::Track(_)) => self.play_from_list(),
@@ -539,10 +554,27 @@ impl App {
         }
     }
 
+    fn back_to_playlists(&mut self) {
+        let ListKind::Playlist(title) = &self.list else { return };
+        self.net.cancel_list();
+        if let Some((entries, selected)) = self.playlist_parent.take() {
+            self.set_entries(ListKind::Playlists, entries);
+            self.selected = selected.min(self.entries.len().saturating_sub(1));
+            self.status = Status::Loaded(ListKind::Playlists, self.entries.len());
+        } else {
+            // Legacy sessions have no cached parent; fetch it and select the
+            // playlist we came from rather than jumping to the first one.
+            self.playlist_return_title = Some(title.clone());
+            self.await_job(Job::Playlists);
+        }
+        self.section = Section::ALL.iter().position(|s| *s == Section::Playlists).unwrap();
+    }
+
     fn open_section(&mut self, section: Section) {
         if let Some(i) = Section::ALL.iter().position(|s| *s == section) {
             self.section = i;
         }
+        self.playlist_return_title = None;
         // Everything below is a request: queue it and let the frame keep coming.
         let job = match section {
             Section::Home => {
@@ -621,7 +653,9 @@ impl App {
             }
             Ok(Outcome::Playlists(ps)) => {
                 self.status = Status::Loaded(kind.clone(), ps.len());
+                let selected = self.playlist_return_title.take().and_then(|title| ps.iter().position(|p| p.title == title));
                 self.set_entries(kind, ps.into_iter().map(Entry::Playlist).collect());
+                if let Some(selected) = selected { self.selected = selected; }
             }
             Ok(Outcome::Stream(_) | Outcome::Lyrics(_) | Outcome::Liked | Outcome::Fetched(_)) => {}
             Err(e) => self.status = Status::Failed(kind, format!("{e:#}")),
@@ -864,6 +898,7 @@ impl App {
             list: self.list.clone(),
             entries: self.entries.clone(),
             selected: self.selected,
+            playlist_parent: self.playlist_parent.clone(),
             section: self.section,
             focus: self.focus,
             queue: self.queue.clone(),
@@ -887,6 +922,7 @@ impl App {
         self.player.set_volume(self.volume);
         self.list = s.list;
         self.entries = s.entries;
+        self.playlist_parent = s.playlist_parent;
         self.selected = s.selected.min(self.entries.len().saturating_sub(1));
         self.section = s.section.min(Section::ALL.len() - 1);
         self.focus = if self.entries.is_empty() { Focus::Nav } else { s.focus };
@@ -1341,9 +1377,102 @@ mod tests {
     }
 
     #[test]
+    fn loop_key_cycles_modes_and_persists_them() {
+        let mut a = app();
+        for mode in [PlaybackMode::Repeat, PlaybackMode::PlaylistLoop, PlaybackMode::All] {
+            press(&mut a, KeyCode::Char('c'));
+            assert_eq!(a.mode, mode);
+            let mut b = app();
+            b.restore(serde_json::from_str(&serde_json::to_string(&a.snapshot()).unwrap()).unwrap());
+            assert_eq!(b.mode, mode);
+        }
+        press(&mut a, KeyCode::Char('r'));
+        assert_eq!(a.mode, PlaybackMode::Random);
+        press(&mut a, KeyCode::Char('c'));
+        assert_eq!(a.mode, PlaybackMode::Repeat);
+        press(&mut a, KeyCode::Char('a'));
+        assert_eq!(a.mode, PlaybackMode::All);
+    }
+
+    #[test]
+    fn natural_completion_stops_or_repeats_the_queue() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('w'));
+        a.selected = a.entries.len() - 1;
+        press_wait(&mut a, KeyCode::Enter);
+        let last = a.queue_pos;
+        a.set_mode(PlaybackMode::Repeat);
+        a.advance(false);
+        settle(&mut a);
+        assert_eq!(a.queue_pos, last);
+        a.set_mode(PlaybackMode::PlaylistLoop);
+        a.advance(false);
+        settle(&mut a);
+        assert_eq!(a.queue_pos, Some(0));
+        a.play_at(last);
+        settle(&mut a);
+        a.set_mode(PlaybackMode::All);
+        a.advance(false);
+        assert_eq!(a.player.state(), PlayerState::Stopped);
+        assert_eq!(a.queue_pos, None);
+    }
+
+    #[test]
+    fn shift_left_returns_to_the_selected_playlist_without_stopping() {
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('p'));
+        assert!(a.entries.len() > 1);
+        press(&mut a, KeyCode::Down);
+        let parent = a.entries.clone();
+        press_wait(&mut a, KeyCode::Enter);
+        assert!(matches!(a.list, ListKind::Playlist(_)));
+        press_wait(&mut a, KeyCode::Enter);
+        let queue = a.queue.clone();
+        let position = a.queue_pos;
+        gate.hold();
+        a.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(a.list, ListKind::Playlists);
+        assert_eq!(a.entries, parent);
+        assert_eq!(a.selected, 1);
+        assert!(!a.net.is_busy(), "cached return does not fetch anything");
+        assert_eq!(a.queue, queue);
+        assert_eq!(a.queue_pos, position);
+        assert_eq!(a.player.state(), PlayerState::Playing);
+        gate.release();
+    }
+
+    #[test]
+    fn restored_playlist_supports_back_navigation_including_legacy_sessions() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('p'));
+        press(&mut a, KeyCode::Down);
+        let parent = a.entries.clone();
+        press_wait(&mut a, KeyCode::Enter);
+        let saved = serde_json::to_value(a.snapshot()).unwrap();
+        for legacy in [false, true] {
+            let mut saved = saved.clone();
+            if legacy { saved.as_object_mut().unwrap().remove("playlist_parent"); }
+            let mut b = app();
+            b.restore(serde_json::from_value(saved).unwrap());
+            b.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+            settle(&mut b);
+            assert_eq!(b.list, ListKind::Playlists);
+            assert_eq!(b.entries, parent);
+            assert_eq!(b.selected, 1);
+        }
+    }
+
+    #[test]
     fn next_index_modes() {
         let mut rng = Rng::seeded(42);
-        assert_eq!(next_index(PlaybackMode::All, 3, 2, false, &mut rng), Some(0));
+        assert_eq!(next_index(PlaybackMode::All, 3, 2, false, &mut rng), None);
+        assert_eq!(next_index(PlaybackMode::All, 3, 1, false, &mut rng), Some(2));
+        assert_eq!(next_index(PlaybackMode::All, 3, 2, true, &mut rng), Some(0));
+        assert_eq!(next_index(PlaybackMode::PlaylistLoop, 3, 2, false, &mut rng), Some(0));
+        assert_eq!(next_index(PlaybackMode::PlaylistLoop, 1, 0, false, &mut rng), Some(0));
+        assert_eq!(next_index(PlaybackMode::All, 1, 0, false, &mut rng), None);
         assert_eq!(next_index(PlaybackMode::Repeat, 3, 1, false, &mut rng), Some(1));
         assert_eq!(next_index(PlaybackMode::Repeat, 3, 1, true, &mut rng), Some(2));
         assert_eq!(next_index(PlaybackMode::All, 0, 0, true, &mut rng), None);

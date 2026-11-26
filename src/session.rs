@@ -18,6 +18,8 @@ pub struct Session {
     pub list: ListKind,
     pub entries: Vec<Entry>,
     pub selected: usize,
+    #[serde(default)]
+    pub playlist_parent: Option<(Vec<Entry>, usize)>,
     pub section: usize,
     pub focus: Focus,
     pub queue: Vec<Track>,

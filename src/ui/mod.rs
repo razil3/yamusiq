@@ -207,7 +207,18 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
     } else {
         t.hint_list
     };
-    let inner = framed_panel(frame, area, &app.list.title(app.lang), hint, focused, p);
+    let in_playlist = matches!(app.list, crate::app::ListKind::Playlist(_));
+    let inner = framed_panel(frame, area, &app.list.title(app.lang), if in_playlist { "" } else { hint }, focused, p);
+    if in_playlist && area.height > 0 {
+        // Back navigation has priority on narrow panels. Other hints use only
+        // the remaining space, so they cannot overwrite the left-hand hint.
+        let width = area.width.saturating_sub(2);
+        let back_width = (text_width(t.hint_back_playlists) as u16 + 2).min(width);
+        let back = Rect::new(area.x + 1, area.y + area.height - 1, back_width, 1);
+        frame.render_widget(Paragraph::new(hint_line(t.hint_back_playlists, p)), back);
+        let rest = Rect::new(back.x + back_width, back.y, width - back_width, 1);
+        frame.render_widget(Paragraph::new(hint_line(hint, p)).alignment(Alignment::Right), rest);
+    }
 
     if app.entries.is_empty() {
         let pad = usize::from(inner.height.saturating_sub(2) / 2);
@@ -512,6 +523,42 @@ mod tests {
             a.tick();
         }
         a
+    }
+
+    #[test]
+    fn playlist_back_hint_is_on_the_bottom_left_in_both_languages() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('p'));
+        press_wait(&mut a, KeyCode::Enter);
+        for lang in [Lang::Ru, Lang::En] {
+            a.lang = lang;
+            for width in [24, 40, 80] {
+                let mut term = Terminal::new(TestBackend::new(width + 6, 18)).unwrap();
+                let area = ratatui::layout::Rect::new(3, 2, width, 14);
+                term.draw(|f| super::draw_list(f, area, &a, &PALETTE)).unwrap();
+                let buf = term.backend().buffer();
+                let text = lang.t().hint_back_playlists;
+                let x = area.x + 2;
+                let y = area.y + area.height - 1;
+                let actual: String = (x..x + super::text_width(text) as u16).map(|x| buf[(x, y)].symbol()).collect();
+                assert_eq!(actual, text, "back hint at width {width}");
+            }
+            a.list = crate::app::ListKind::Likes;
+            assert!(!render(&a, 130, 40).contains(lang.t().hint_back_playlists));
+            a.list = crate::app::ListKind::Playlist("test".into());
+        }
+    }
+
+    #[test]
+    fn loop_modes_have_distinct_visible_labels() {
+        let mut a = playing_at(10);
+        for lang in [Lang::Ru, Lang::En] {
+            a.lang = lang;
+            for mode in [crate::app::PlaybackMode::All, crate::app::PlaybackMode::Repeat, crate::app::PlaybackMode::PlaylistLoop] {
+                a.mode = mode;
+                assert!(render(&a, 180, 45).contains(mode.label(lang)), "missing mode label: {}", mode.label(lang));
+            }
+        }
     }
 
     #[test]
