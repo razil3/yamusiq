@@ -14,9 +14,9 @@ pub trait MusicService: Send {
     fn playlists(&self) -> Result<Vec<Playlist>>;
     fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>>;
     fn my_wave(&self) -> Result<Vec<Track>>;
+    /// Liked tracks without a display cap.
     fn likes(&self) -> Result<Vec<Track>>;
-    /// Every liked track, without the display cap of [`likes`](Self::likes)
-    /// (used by the favourites sync).
+    /// Every liked track for the favourites sync; defaults to the same full list.
     fn likes_all(&self) -> Result<Vec<Track>> {
         self.likes()
     }

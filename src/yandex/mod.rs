@@ -15,8 +15,6 @@ use crate::model::{Lyrics, Playlist, Quality, Stream, Track};
 use crate::service::{normalize, MusicService};
 use client::Client;
 
-/// How many liked tracks to load at once (newest first).
-const LIKES_LIMIT: usize = 300;
 /// `/tracks` accepts batches; keep requests modest.
 const BATCH: usize = 100;
 /// Artist catalogue paging for "all tracks".
@@ -75,13 +73,12 @@ impl YandexService {
             .collect())
     }
 
-    /// Liked tracks, newest first; `limit` caps how many are fetched.
-    fn liked_tracks(&self, limit: Option<usize>) -> Result<Vec<Track>> {
+    /// All liked tracks, newest first, resolved in batches by `fetch_tracks`.
+    fn liked_tracks(&self) -> Result<Vec<Track>> {
         let refs = self.like_refs()?;
         *self.liked.lock().unwrap() = Some(refs.iter().map(|(id, _)| id.clone()).collect());
         let ids: Vec<String> = refs
             .into_iter()
-            .take(limit.unwrap_or(usize::MAX))
             .map(|(id, album)| album.map_or(id.clone(), |a| format!("{id}:{a}")))
             .collect();
         let mut tracks = self.fetch_tracks(&ids)?;
@@ -221,11 +218,11 @@ impl MusicService for YandexService {
     }
 
     fn likes(&self) -> Result<Vec<Track>> {
-        self.liked_tracks(Some(LIKES_LIMIT))
+        self.liked_tracks()
     }
 
     fn likes_all(&self) -> Result<Vec<Track>> {
-        self.liked_tracks(None)
+        self.liked_tracks()
     }
 
     fn cached(&self) -> Result<Vec<Track>> {
@@ -332,6 +329,60 @@ mod tests {
     /// The service moves to a worker thread in 1.1.0, which only compiles if the
     /// whole value is `Send`. This test is the compile-time check for that:
     /// remove it and the guarantee quietly rots.
+    #[test]
+    fn favourites_load_beyond_300_in_batches() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for request in 0..5 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let expected = if request == 0 { "GET /users/1/likes/tracks " } else { "POST /tracks " };
+                assert!(line.starts_with(expected), "unexpected request: {line}");
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let result = if request == 0 {
+                    serde_json::json!({"library": {"tracks": (1..=350).map(|id| serde_json::json!({"id": id})).collect::<Vec<_>>()}})
+                } else {
+                    let first = (request - 1) * 100 + 1;
+                    let last = (request * 100).min(350);
+                    let ids = (first..=last).map(|id| id.to_string()).collect::<Vec<_>>().join("%2C");
+                    let form = String::from_utf8(body).unwrap();
+                    assert!(form.contains(&format!("track-ids={ids}&")), "unexpected batch: {form}");
+                    serde_json::json!((first..=last).map(|id| serde_json::json!({"id": id, "title": format!("Track {id}")})).collect::<Vec<_>>())
+                };
+                let body = serde_json::json!({"result": result}).to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let service = YandexService {
+            client: Client::for_test(base), uid: 1, name: "test".into(),
+            liked: Arc::new(Mutex::new(None)),
+        };
+        let tracks = service.likes().unwrap();
+        assert_eq!(tracks.len(), 350);
+        assert_eq!(tracks[300].id, "301");
+        assert_eq!(tracks[349].id, "350");
+        assert!(tracks.iter().all(|t| t.liked));
+        server.join().unwrap();
+    }
+
     #[test]
     fn service_can_move_between_threads() {
         fn assert_send<T: Send>() {}

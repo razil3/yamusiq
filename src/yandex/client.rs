@@ -13,6 +13,8 @@ pub const DESKTOP: &str = "YandexMusicDesktopAppWindows/5.13.2";
 pub struct Client {
     agent: ureq::Agent,
     token: String,
+    #[cfg(test)]
+    base: String,
 }
 
 impl Client {
@@ -22,7 +24,24 @@ impl Client {
             .timeout(Duration::from_secs(20))
             .user_agent(concat!("yamusiq/", env!("CARGO_PKG_VERSION")))
             .build();
-        Self { agent, token: token.trim().to_string() }
+        Self {
+            agent,
+            token: token.trim().to_string(),
+            #[cfg(test)]
+            base: BASE.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(base: String) -> Self {
+        Self { base, ..Self::new("test-token") }
+    }
+
+    fn base(&self) -> &str {
+        #[cfg(test)]
+        { &self.base }
+        #[cfg(not(test))]
+        { BASE }
     }
 
     fn authed(&self, req: ureq::Request) -> ureq::Request {
@@ -41,7 +60,7 @@ impl Client {
     /// Like [`get`](Self::get) but identifying as a specific client; some
     /// endpoints (e.g. `/get-file-info`) only answer the desktop app.
     pub fn get_as(&self, path: &str, query: &[(&str, &str)], client: &str) -> Result<Value> {
-        let mut req = self.authed_as(self.agent.get(&format!("{BASE}{path}")), client);
+        let mut req = self.authed_as(self.agent.get(&format!("{}{path}", self.base())), client);
         for (k, v) in query {
             req = req.query(k, v);
         }
@@ -50,7 +69,7 @@ impl Client {
 
     /// POST a form to `path` and return the response's `result` field.
     pub fn post_form(&self, path: &str, form: &[(&str, &str)]) -> Result<Value> {
-        let req = self.authed(self.agent.post(&format!("{BASE}{path}")));
+        let req = self.authed(self.agent.post(&format!("{}{path}", self.base())));
         result(req.send_form(form), path)
     }
 

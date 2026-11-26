@@ -893,6 +893,12 @@ impl App {
         self.queue = s.queue;
         let pos = s.queue_pos.filter(|&i| i < self.queue.len());
         self.queue_pos = pos;
+        // Sessions written by older versions may contain only the first 300
+        // favourites. Keep them visible until the full list arrives, but leave
+        // the playback queue intact so restoring does not change the track.
+        if self.list == ListKind::Likes {
+            self.await_job(Job::Likes);
+        }
         let Some(i) = pos else { return };
         let track = self.queue[i].clone();
         let saved_at = if s.position_secs.is_finite() { s.position_secs.max(0.0) } else { 0.0 };
@@ -1501,6 +1507,41 @@ mod tests {
         assert_eq!(a.lyric_line(), None);
         press(&mut a, KeyCode::Char(']')); // harmless
         assert!(!a.lyrics_manual());
+    }
+
+    #[test]
+    fn restored_favourites_refresh_a_truncated_saved_list() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('l'));
+        let full_count = a.entries.len();
+        assert!(full_count > 1);
+        press_wait(&mut a, KeyCode::Enter);
+        let mut saved = a.snapshot();
+        saved.entries.truncate(1);
+        saved.queue.truncate(1);
+        let track_id = saved.queue[0].id.clone();
+
+        let mut b = app();
+        b.restore(saved);
+        assert_eq!(b.entries.len(), 1, "saved list stays visible during refresh");
+        settle(&mut b);
+        assert_eq!(b.entries.len(), full_count, "full favourites replace the saved subset");
+        assert_eq!(b.queue.len(), 1, "refresh must not replace the playback queue");
+        assert_eq!(b.current_track().unwrap().id, track_id);
+        assert_eq!(b.player.state(), PlayerState::Paused);
+        press(&mut b, KeyCode::Down);
+        assert_eq!(b.selected, 1, "can navigate beyond the old saved subset");
+        press_wait(&mut b, KeyCode::Enter);
+        assert_eq!(b.queue.len(), full_count, "playing from the refreshed list creates a full queue");
+
+        let mut saved = b.snapshot();
+        saved.entries.truncate(1);
+        saved.queue.clear();
+        saved.queue_pos = None;
+        let mut c = app();
+        c.restore(saved);
+        settle(&mut c);
+        assert_eq!(c.entries.len(), full_count, "refresh also works without a playing track");
     }
 
     #[test]
