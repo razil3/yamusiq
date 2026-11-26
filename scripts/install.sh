@@ -16,6 +16,17 @@ REPO="${REPO:-razil3/yamusiq}"
 VERSION="${YAMUSIQ_VERSION:-latest}"
 BASE="https://github.com/$REPO/releases"
 
+# "latest" means the most recent tag. releases/latest only answers for GitHub
+# releases, and ours are cut by hand, so ask the API for the newest tag.
+if [ "$VERSION" = "latest" ]; then
+    VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/tags?per_page=1" \
+        | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p' | head -1)"
+    if [ -z "$VERSION" ]; then
+        echo "yamusiq: could not work out the latest release; set YAMUSIQ_VERSION=v1.0.0" >&2
+        exit 1
+    fi
+fi
+
 case "$(uname -s)" in
     Darwin) ;;
     *) echo "yamusiq: this script installs macOS builds; for other systems build from source" >&2; exit 1 ;;
