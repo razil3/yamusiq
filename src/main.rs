@@ -7,6 +7,7 @@ mod i18n;
 mod library;
 mod login;
 mod model;
+mod net;
 mod player;
 mod service;
 mod session;

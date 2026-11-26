@@ -7,7 +7,7 @@ use anyhow::Result;
 
 use crate::model::{Lyrics, Playlist, Quality, Stream, Track};
 
-pub trait MusicService {
+pub trait MusicService: Send {
     /// Human-readable backend name shown in the UI.
     fn name(&self) -> &str;
     fn search(&self, query: &str) -> Result<Vec<Track>>;
