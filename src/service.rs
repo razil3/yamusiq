@@ -30,6 +30,7 @@ pub trait MusicService: Send {
     fn name(&self) -> &str;
     fn search(&self, query: &str) -> Result<Vec<Track>>;
     fn playlists(&self) -> Result<Vec<Playlist>>;
+    fn home_playlists(&self) -> Result<Vec<crate::home::Recommendation>> { Ok(Vec::new()) }
     fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>>;
     fn my_wave(&self) -> Result<Vec<Track>>;
     fn radio_batch(&self, station: &str, _queue: Option<&str>) -> Result<crate::radio::Batch> {

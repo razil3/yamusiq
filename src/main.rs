@@ -1,3 +1,6 @@
+mod cover;
+mod home;
+mod startup;
 mod app;
 mod radio;
 mod links;
@@ -11,6 +14,7 @@ mod i18n;
 mod library;
 mod login;
 mod model;
+mod media;
 mod net;
 mod player;
 mod service;
@@ -164,6 +168,7 @@ fn real_main() -> Result<()> {
         return Ok(());
     }
 
+    if startup::open_terminal_if_needed(&args)? { return Ok(()); }
     let service = connect(lang, has("--login"))?;
     let (player, problem): (Box<dyn Player>, Option<String>) = match AudioPlayer::new() {
         Ok(p) => (Box::new(p), None),
@@ -216,11 +221,23 @@ fn run(
     if let Some(session) = session::Session::load() {
         app.restore(session);
     }
+    app.load_home();
+    let audio_available = problem.is_none();
     if let Some(problem) = problem {
         app.status = app::Status::AudioDown(problem);
     }
+    // A windowless AppKit pump services MediaPlayer callbacks. Do not claim
+    // system playback when the audio device failed and SimPlayer is in use.
+    let mut media = audio_available.then(media::Controls::new);
     let mut titled = None;
     while !app.should_quit {
+        if let Some(media) = media.as_mut() {
+            for command in media.poll() { app.on_media_command(command); }
+            let snapshot = app.media_snapshot();
+            media.update(&snapshot);
+            app.cover_preview = snapshot.track.as_ref().and_then(|track|
+                media.preview().map(|preview| (track.id.clone(), preview)));
+        }
         // Window title follows the interface language.
         if titled != Some(app.lang) {
             execute!(terminal.backend_mut(), SetTitle(app.lang.t().window_title))?;

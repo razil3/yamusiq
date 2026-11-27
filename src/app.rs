@@ -99,6 +99,7 @@ pub enum ListKind {
     Search(String),
     TrackWave(String),
     Playlist(String),
+    HomePlaylist(crate::home::Kind),
     Artist(String),
     ArtistAll(String),
 }
@@ -115,6 +116,7 @@ impl ListKind {
             Self::Playlists => t.list_playlists.into(),
             Self::Search(q) => fill(t.list_search, &[q]),
             Self::Playlist(n) => fill(t.list_playlist, &[n]),
+            Self::HomePlaylist(kind) => fill(t.list_playlist, &[kind.title(lang)]),
             Self::Artist(n) => fill(t.list_artist, &[n]),
             Self::ArtistAll(n) => fill(t.list_artist_all, &[n]),
         }
@@ -248,7 +250,8 @@ fn job_kind(job: &Job) -> ListKind {
         Job::Likes | Job::LikesMore { .. } => ListKind::Likes,
         Job::Cached => ListKind::Cached,
         Job::Playlists => ListKind::Playlists,
-        Job::PlaylistTracks { title, .. } => ListKind::Playlist(title.clone()),
+        Job::HomePlaylists => ListKind::Overview,
+        Job::PlaylistTracks { title, personal, .. } => personal.map_or_else(|| ListKind::Playlist(title.clone()), ListKind::HomePlaylist),
         Job::Search { query } => ListKind::Search(query.clone()),
         Job::Artist { track, all } => {
             let name = track.artist.split(", ").next().unwrap_or(&track.artist).to_string();
@@ -256,7 +259,7 @@ fn job_kind(job: &Job) -> ListKind {
         }
         // These do not fill a list; the status line describes them itself.
         Job::RadioMore { .. } | Job::RadioNext { .. } | Job::Feedback { .. } | Job::OpenTrack { .. } | Job::CopyLink { .. }
-        | Job::SyncLikes
+        | Job::SyncLikes | Job::TrackCover { .. }
         | Job::Stream { .. }
         | Job::Lyrics { .. }
         | Job::Like { .. }
@@ -350,8 +353,10 @@ pub struct App {
     feedback_sequence: u64,
     pub list: ListKind,
     pub entries: Vec<Entry>,
+    pub home: crate::home::Home,
     pub selected: usize,
     playlist_parent: Option<(Vec<Entry>, usize)>,
+    playlist_parent_kind: Option<ListKind>,
     artist_likes_parent: Option<LikesParent>,
     playlist_return_title: Option<String>,
     pub queue: Vec<Track>,
@@ -370,6 +375,8 @@ pub struct App {
     pub wave_history: VecDeque<Vec<f32>>,
     /// Quality label of the current stream ("FLAC · lossless"), if any.
     pub quality: Option<String>,
+    /// Experimental, transient TUI cover; never serialized into sessions.
+    pub cover_preview: Option<(String, std::sync::Arc<crate::cover::Preview>)>,
     /// Preferred stream quality (persisted).
     pub quality_pref: Quality,
     /// Lossless was asked for but this track only has a lossy stream.
@@ -384,6 +391,8 @@ pub struct App {
     pending_resume: Option<(usize, Duration)>,
     /// Space can request playback before the restored stream has arrived.
     restore_should_play: bool,
+    /// A system Pause during buffering must survive until audio is ready.
+    pause_when_ready: bool,
     play_requested_at: Option<Instant>,
     /// Track, position and pause state to restore after a quality switch.
     pending_quality: Option<(String, Duration, bool)>,
@@ -442,8 +451,10 @@ impl App {
             feedback_sequence: 0,
             list: ListKind::Overview,
             entries: Vec::new(),
+            home: crate::home::Home::default(),
             selected: 0,
             playlist_parent: None,
+            playlist_parent_kind: None,
             artist_likes_parent: None,
             playlist_return_title: None,
             queue: Vec::new(),
@@ -456,6 +467,7 @@ impl App {
             wave: None,
             wave_history: VecDeque::new(),
             quality: None,
+            cover_preview: None,
             quality_pref: Quality::default(),
             lossless_missing: false,
             playing_local: false,
@@ -463,6 +475,7 @@ impl App {
             pending_remove: None,
             pending_resume: None,
             restore_should_play: false,
+            pause_when_ready: false,
             play_requested_at: None,
             pending_quality: None,
             sync: None,
@@ -485,6 +498,72 @@ impl App {
         match self.entries.get(self.selected) {
             Some(Entry::Track(t)) => Some(t),
             _ => None,
+        }
+    }
+
+    /// System media commands bypass search/help/link prompts, never move the
+    /// list cursor, and reuse the same queue/radio operations as the keyboard.
+    pub fn on_media_command(&mut self, command: crate::media::Command) {
+        use crate::media::{Command, State};
+        if !self.media_snapshot().accepts(command) { return; }
+        match command {
+            Command::Seek(position) => {
+                if let Some(track) = self.current_track() {
+                    self.player.seek(position.min(track.duration()));
+                    if let Some(view) = self.lyrics.as_mut() { view.manual = None; }
+                }
+            }
+            Command::Next => { self.pause_when_ready = false; self.advance(true); }
+            Command::Previous => { self.pause_when_ready = false; self.previous(); }
+            Command::Play | Command::Pause | Command::Toggle => {
+                let playing = self.media_state() == State::Playing;
+                let play = match command {
+                    Command::Play => true,
+                    Command::Pause => false,
+                    _ => !playing,
+                };
+                if self.pending_resume.is_some() && self.net.loading_stream() {
+                    self.restore_should_play = play;
+                } else if self.net.loading_stream() || self.likes_waiting || self.radio_waiting {
+                    self.pause_when_ready = !play;
+                } else if (play && self.player.state() != PlayerState::Playing)
+                    || (!play && self.player.state() == PlayerState::Playing)
+                {
+                    self.toggle_pause();
+                }
+            }
+        }
+    }
+
+    fn media_state(&self) -> crate::media::State {
+        use crate::media::State;
+        if self.pending_resume.is_some() && self.net.loading_stream() {
+            return if self.restore_should_play { State::Playing } else { State::Paused };
+        }
+        if self.net.loading_stream() || self.likes_waiting || self.radio_waiting {
+            return if self.pause_when_ready { State::Paused } else { State::Playing };
+        }
+        match self.player.state() {
+            PlayerState::Playing => State::Playing,
+            PlayerState::Paused => State::Paused,
+            PlayerState::Stopped => State::Stopped,
+        }
+    }
+
+    pub fn media_snapshot(&self) -> crate::media::Snapshot {
+        let track = self.current_track();
+        crate::media::Snapshot {
+            track: track.map(|t| crate::media::Metadata {
+                id: t.id.clone(), title: t.title.clone(), artist: t.artist.clone(),
+                album: t.album.clone(), duration: t.duration(), cover_uri: t.cover_uri.clone(),
+            }),
+            state: self.media_state(),
+            position: self.pending_resume.map(|(_, at)| at).unwrap_or_else(|| self.player.position()),
+            can_play: track.is_some() || self.selected_track().is_some(),
+            can_navigate: track.is_some(),
+            can_seek: track.is_some_and(|t| !t.duration().is_zero())
+                && self.player.state() != PlayerState::Stopped
+                && !self.net.loading_stream() && !self.likes_waiting && !self.radio_waiting,
         }
     }
 
@@ -544,6 +623,8 @@ impl App {
             }
             KeyCode::Char('o') => self.cycle_quality(),
             KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => self.back_to_parent(),
+            KeyCode::Left if self.home_focused() => self.move_home(-1),
+            KeyCode::Right if self.home_focused() => self.move_home(1),
             KeyCode::Left => self.seek_by(-5),
             KeyCode::Right => self.seek_by(5),
             KeyCode::Char('[') => self.scroll_lyrics(-1.0),
@@ -554,7 +635,7 @@ impl App {
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
-                    Focus::Nav if !self.entries.is_empty() => Focus::List,
+                    Focus::Nav if !self.entries.is_empty() || self.list == ListKind::Overview => Focus::List,
                     _ => Focus::Nav,
                 }
             }
@@ -673,7 +754,21 @@ impl App {
         self.status = Status::Mode(mode);
     }
 
+    fn home_focused(&self) -> bool {
+        self.focus == Focus::List && self.list == ListKind::Overview
+    }
+
+    fn move_home(&mut self, delta: isize) {
+        self.selected = self.selected.saturating_add_signed(delta).min(2);
+    }
+
+    pub fn playlist_parent_is_home(&self) -> bool {
+        matches!(self.list, ListKind::HomePlaylist(_)) || self.playlist_parent_kind == Some(ListKind::Overview)
+    }
+
     fn move_selection(&mut self, delta: isize) {
+        if self.home_focused() { return; }
+
         let (cursor, len) = match self.focus {
             Focus::Nav => (&mut self.section, Section::ALL.len()),
             Focus::List => (&mut self.selected, self.entries.len()),
@@ -692,12 +787,26 @@ impl App {
     }
 
     fn activate(&mut self) {
+        if self.home_focused() {
+            if let Some(card) = self.home.playlist(self.selected) {
+                let playlist = card.playlist.clone();
+                let personal = Some(card.kind);
+                self.playlist_parent = Some((Vec::new(), self.selected));
+                self.playlist_parent_kind = Some(ListKind::Overview);
+                self.await_job(Job::PlaylistTracks { id: playlist.id, title: playlist.title, personal });
+            } else if self.home.failed {
+                self.open_section(Section::Home);
+                self.focus = Focus::List;
+            }
+            return;
+        }
         match self.focus {
             Focus::Nav => self.open_section(Section::ALL[self.section]),
             Focus::List => match self.entries.get(self.selected).cloned() {
                 Some(Entry::Playlist(p)) => {
                     self.playlist_parent = Some((self.entries.clone(), self.selected));
-                    self.await_job(Job::PlaylistTracks { id: p.id.clone(), title: p.title.clone() });
+                    self.playlist_parent_kind = Some(self.list.clone());
+                    self.await_job(Job::PlaylistTracks { id: p.id.clone(), title: p.title.clone(), personal: None });
                 }
                 Some(Entry::Track(_)) => self.play_from_list(),
                 None => {}
@@ -723,9 +832,24 @@ impl App {
     }
 
     fn back_to_playlists(&mut self) {
+        if let ListKind::HomePlaylist(kind) = self.list {
+            let fallback = crate::home::Kind::ALL.iter().position(|k| *k == kind).unwrap_or(0);
+            let selected = self.playlist_parent.take().map_or(fallback, |(_, selected)| selected);
+            self.playlist_parent_kind = None;
+            self.open_section(Section::Home);
+            self.selected = selected.min(2);
+            self.focus = Focus::List;
+            return;
+        }
         let ListKind::Playlist(title) = &self.list else { return };
         self.net.cancel_list();
         if let Some((entries, selected)) = self.playlist_parent.take() {
+            if self.playlist_parent_kind.take() == Some(ListKind::Overview) {
+                self.open_section(Section::Home);
+                self.selected = selected.min(2);
+                self.focus = Focus::List;
+                return;
+            }
             self.set_entries(ListKind::Playlists, entries);
             self.selected = selected.min(self.entries.len().saturating_sub(1));
             self.status = Status::Loaded(ListKind::Playlists, self.entries.len());
@@ -748,7 +872,14 @@ impl App {
             Section::Home => {
                 self.net.cancel_list();
                 self.set_entries(ListKind::Overview, Vec::new());
+                self.home.loading = false;
+                self.home.failed = false;
                 self.status = Status::Home;
+                self.focus = Focus::List;
+                if !self.home.loaded {
+                    self.home.loading = true;
+                    self.await_job(Job::HomePlaylists);
+                }
                 return;
             }
             Section::Wave => Job::Wave,
@@ -761,6 +892,7 @@ impl App {
 
     /// Queues a catalogue job and says so in the footer while it runs.
     fn await_job(&mut self, job: Job) {
+        if job != Job::HomePlaylists { self.home.loading = false; }
         let kind = job_kind(&job);
         self.net.post(job);
         self.status = Status::Loading(kind);
@@ -773,6 +905,9 @@ impl App {
         // handlers so the status line keeps saying "playing" / "buffering".
         if let Job::Stream { track, position, .. } = &done.job {
             return self.finish_stream(track.clone(), *position, done.result);
+        }
+        if let Job::TrackCover { id } = &done.job {
+            return self.finish_track_cover(id, done.result);
         }
         if let Job::Lyrics { track_id } = &done.job {
             return self.finish_lyrics(track_id.clone(), done.result);
@@ -847,6 +982,21 @@ impl App {
             return true;
         }
         let kind = job_kind(&done.job);
+        if done.job == Job::HomePlaylists {
+            self.home.loading = false;
+            match done.result {
+                Ok(Outcome::HomePlaylists(playlists)) => {
+                    self.home.finish(playlists);
+                    self.status = Status::Home;
+                }
+                Err(e) => {
+                    self.home.failed = true;
+                    self.status = Status::Failed(ListKind::Overview, format!("{e:#}"));
+                }
+                _ => {}
+            }
+            return true;
+        }
         match done.result {
             Ok(Outcome::LikesPage(page)) => {
                 let Some(refs) = page.refs else { return true };
@@ -887,7 +1037,7 @@ impl App {
                 self.set_entries(kind, ps.into_iter().map(Entry::Playlist).collect());
                 if let Some(selected) = selected { self.selected = selected; }
             }
-            Ok(Outcome::Stream(_) | Outcome::Lyrics(_) | Outcome::Liked | Outcome::Fetched(_) | Outcome::Track(_) | Outcome::Ack | Outcome::Radio(_)) => {}
+            Ok(Outcome::HomePlaylists(_) | Outcome::Stream(_) | Outcome::Lyrics(_) | Outcome::Liked | Outcome::Fetched(_) | Outcome::Track(_) | Outcome::Ack | Outcome::Radio(_)) => {}
             Err(e) => self.status = Status::Failed(kind, format!("{e:#}")),
         }
         true
@@ -936,13 +1086,36 @@ impl App {
                 self.status = Status::SessionRestored(track.title.clone());
             }
             self.restore_should_play = false;
+        } else if self.pause_when_ready {
+            self.player.toggle_pause();
+            self.status = Status::Paused;
         } else {
             self.status = Status::Playing { artist: track.artist.clone(), title: track.title.clone() };
         }
+        self.pause_when_ready = false;
         if let Some(started) = self.play_requested_at.take() { crate::timing::record("playback.ready", started.elapsed()); }
         if self.player.state() == PlayerState::Playing { self.begin_radio_track(); }
         self.wave_history.clear();
         self.load_lyrics();
+        if self.current_track().is_some_and(|t| t.cover_uri.is_none()) {
+            self.net.post(Job::TrackCover { id: track.id.clone() });
+        }
+        true
+    }
+
+    fn finish_track_cover(&mut self, id: &str, result: anyhow::Result<Outcome>) -> bool {
+        if self.current_track().is_none_or(|t| t.id != id) { return true; }
+        if let Ok(Outcome::Track(Some(track))) = result
+            && track.id == id && track.cover_uri.is_some()
+        {
+            for queued in &mut self.queue {
+                if queued.id == id { queued.cover_uri = track.cover_uri.clone(); }
+            }
+            for entry in &mut self.entries {
+                if let Entry::Track(t) = entry && t.id == id { t.cover_uri = track.cover_uri.clone(); }
+            }
+        }
+        // Optional artwork failures never overwrite playback status.
         true
     }
 
@@ -1006,6 +1179,7 @@ impl App {
     }
 
     fn play_at(&mut self, pos: Option<usize>) {
+        self.pause_when_ready &= self.likes_waiting || self.radio_waiting;
         self.play_requested_at = Some(Instant::now());
         self.likes_waiting = false;
         self.end_radio_track(EventKind::Skip);
@@ -1163,6 +1337,7 @@ impl App {
             entries: self.entries.clone(),
             selected: self.selected,
             playlist_parent: self.playlist_parent.clone(),
+            playlist_parent_kind: self.playlist_parent_kind.clone(),
             section: self.section,
             focus: self.focus,
             queue: self.queue.clone(),
@@ -1191,9 +1366,19 @@ impl App {
         self.list = s.list;
         self.entries = s.entries;
         self.playlist_parent = s.playlist_parent;
-        self.selected = s.selected.min(self.entries.len().saturating_sub(1));
+        self.playlist_parent_kind = s.playlist_parent_kind;
+        // Older Home sessions stored a raw API title. Their cached Home card
+        // index identifies the mix without translating user playlist names.
+        if matches!(self.list, ListKind::Playlist(_))
+            && self.playlist_parent_is_home()
+            && let Some((_, index)) = &self.playlist_parent
+            && let Some(kind) = crate::home::Kind::ALL.get(*index)
+        {
+            self.list = ListKind::HomePlaylist(*kind);
+        }
+        self.selected = s.selected.min(if self.list == ListKind::Overview { 2 } else { self.entries.len().saturating_sub(1) });
         self.section = s.section.min(Section::ALL.len() - 1);
-        self.focus = if self.entries.is_empty() { Focus::Nav } else { s.focus };
+        self.focus = if self.entries.is_empty() && self.list != ListKind::Overview { Focus::Nav } else { s.focus };
         self.queue = s.queue;
         self.likes_list = s.likes_list.filter(|c| self.list == ListKind::Likes && c.valid() && c.next >= self.entries.len());
         self.likes_queue = s.likes_queue.filter(|c| c.valid() && c.next >= self.queue.len());
@@ -1223,6 +1408,7 @@ impl App {
         self.play_requested_at = Some(Instant::now());
         self.pending_resume = Some((i, at));
         self.restore_should_play = false;
+        self.pause_when_ready = false;
         self.playing_local = false;
         if let Some(source) = self.library.local_stream(&track.id) {
             self.playing_local = true;
@@ -1674,8 +1860,16 @@ impl App {
         if self.radio_waiting { self.play_at(Some(old_len)); }
     }
 
+    pub fn load_home(&mut self) {
+        if self.list == ListKind::Overview && !self.home.loaded && !self.home.loading {
+            self.home.loading = true;
+            self.await_job(Job::HomePlaylists);
+        }
+    }
+
     pub fn tick(&mut self) {
         while self.collect_job() {}
+        self.home.poll_covers();
         if self.list == ListKind::Likes
             && (self.entries.is_empty() || (self.focus == Focus::List && self.selected.saturating_add(likes::PREFETCH + 1) >= self.entries.len()))
             && let Some(cursor) = self.likes_list.clone()
@@ -1852,6 +2046,157 @@ mod tests {
 
         assert_eq!(a.list, ListKind::Likes, "the newer request wins");
         assert!(matches!(a.status, Status::Loaded(ListKind::Likes, _)), "no stale wave answer: {:?}", a.status);
+    }
+
+    #[test]
+    fn home_cards_open_and_return_to_the_same_card_including_saved_sessions() {
+        let mut a = app();
+        a.open_section(Section::Home);
+        settle(&mut a);
+        assert_eq!(a.home.playlists.len(), 3);
+        assert_eq!(a.focus, Focus::List);
+        press(&mut a, KeyCode::Right);
+        press(&mut a, KeyCode::Right);
+        press(&mut a, KeyCode::Right);
+        assert_eq!(a.selected, 2);
+        press_wait(&mut a, KeyCode::Enter);
+        assert_eq!(a.list, ListKind::HomePlaylist(crate::home::Kind::Stash));
+        assert!(a.entries.iter().all(|e| matches!(e, Entry::Track(_))));
+        assert!(!a.entries.is_empty());
+        assert!(a.current_track().is_none(), "opening a card never autoplays");
+        let session = serde_json::to_string(&a.snapshot()).unwrap();
+        let mut restored = app();
+        restored.restore(serde_json::from_str(&session).unwrap());
+        for a in [&mut a, &mut restored] {
+            a.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+            settle(a);
+            assert_eq!(a.list, ListKind::Overview);
+            assert_eq!(a.section, 0);
+            assert_eq!(a.selected, 2);
+            assert_eq!(a.focus, Focus::List);
+            assert_eq!(a.home.playlists.len(), 3);
+        }
+    }
+
+    #[test]
+    fn personal_playlist_titles_translate_while_loading_loaded_and_restored() {
+        use crate::home::Kind;
+        let mut a = app();
+        a.open_section(Section::Home);
+        settle(&mut a);
+        for (index, kind) in Kind::ALL.into_iter().enumerate() {
+            a.lang = Lang::En;
+            a.selected = index;
+            press(&mut a, KeyCode::Enter);
+            assert_eq!(a.status, Status::Loading(ListKind::HomePlaylist(kind)));
+            assert!(a.status.text(Lang::En).contains(kind.title(Lang::En)));
+            assert!(!a.status.text(Lang::En).contains(kind.title(Lang::Ru)));
+            settle(&mut a);
+            assert_eq!(a.list, ListKind::HomePlaylist(kind));
+            let loaded = a.status.clone();
+            assert!(loaded.text(Lang::En).contains(kind.title(Lang::En)));
+            assert!(loaded.text(Lang::En).contains("tracks"));
+            assert!(!loaded.text(Lang::En).contains(kind.title(Lang::Ru)));
+            press(&mut a, KeyCode::Char('i'));
+            assert_eq!(a.lang, Lang::Ru);
+            assert!(a.list_caption().contains(kind.title(Lang::Ru)));
+            assert!(loaded.text(a.lang).contains(kind.title(Lang::Ru)));
+            press(&mut a, KeyCode::Char('i'));
+            assert!(a.list_caption().contains(kind.title(Lang::En)));
+            let json = serde_json::to_string(&a.snapshot()).unwrap();
+            let mut restored = app();
+            restored.lang = Lang::En;
+            restored.restore(serde_json::from_str(&json).unwrap());
+            assert_eq!(restored.list, ListKind::HomePlaylist(kind));
+            assert!(restored.list_caption().contains(kind.title(Lang::En)));
+            // Upgrade sessions written before Home kept a stable mix type.
+            let mut legacy = a.snapshot();
+            legacy.list = ListKind::Playlist(kind.title(Lang::Ru).into());
+            restored.restore(legacy);
+            assert_eq!(restored.list, ListKind::HomePlaylist(kind));
+            assert!(restored.list_caption().contains(kind.title(Lang::En)));
+            a.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+            settle(&mut a);
+            assert_eq!(a.list, ListKind::Overview);
+            assert_eq!(a.selected, index);
+        }
+        // Matching a generated playlist's name is not enough: ordinary user
+        // playlists must never be translated or migrated based on title alone.
+        a.list = ListKind::Playlist("Плейлист дня".into());
+        a.playlist_parent_kind = Some(ListKind::Playlists);
+        let mut restored = app();
+        restored.lang = Lang::En;
+        restored.restore(a.snapshot());
+        assert_eq!(restored.list, ListKind::Playlist("Плейлист дня".into()));
+        assert!(restored.list_caption().contains("Плейлист дня"));
+    }
+
+    #[test]
+    fn home_arrows_change_cards_only_with_list_focus_and_never_seek() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('w'));
+        press_wait(&mut a, KeyCode::Enter);
+        a.player.seek(Duration::from_secs(20));
+        a.open_section(Section::Home);
+        settle(&mut a);
+        let queue = a.queue.clone();
+        let at = a.player.position();
+        press(&mut a, KeyCode::Right);
+        assert_eq!(a.selected, 1);
+        assert!(a.player.position().abs_diff(at) < Duration::from_secs(1));
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.selected, 1, "cards are horizontal");
+        press(&mut a, KeyCode::Left);
+        assert_eq!(a.selected, 0);
+        press(&mut a, KeyCode::Left);
+        assert_eq!(a.selected, 0);
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.focus, Focus::Nav);
+        press(&mut a, KeyCode::Right);
+        assert!(a.player.position() >= at + Duration::from_secs(4));
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.focus, Focus::List);
+        assert_eq!(a.queue, queue);
+    }
+
+    #[test]
+    fn cancelled_home_load_cannot_replace_a_newer_section() {
+        let fake = FakeService::parked();
+        let gate = fake.gate();
+        gate.hold();
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        a.open_section(Section::Home);
+        assert!(a.home.loading);
+        press(&mut a, KeyCode::Right);
+        press(&mut a, KeyCode::Enter);
+        assert!(a.current_track().is_none());
+        a.open_section(Section::Likes);
+        gate.release();
+        settle(&mut a);
+        assert_eq!(a.list, ListKind::Likes);
+        assert!(!a.home.loading);
+        a.open_section(Section::Home);
+        settle(&mut a);
+        assert_eq!(a.home.playlists.len(), 3);
+    }
+
+    #[test]
+    fn home_error_stops_loading_and_enter_retries_without_autoplay() {
+        let fake = FakeService::default();
+        let failed = fake.home_fail.clone();
+        failed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        a.open_section(Section::Home);
+        settle(&mut a);
+        assert!(a.home.failed && !a.home.loading);
+        assert!(matches!(a.status, Status::Failed(ListKind::Overview, _)));
+        for _ in 0..10 { a.tick(); }
+        assert!(!a.net.is_busy(), "no automatic retry loop");
+        failed.store(false, std::sync::atomic::Ordering::SeqCst);
+        press_wait(&mut a, KeyCode::Enter);
+        assert!(a.home.loaded && !a.home.failed);
+        assert_eq!(a.home.playlists.len(), 3);
+        assert!(a.queue.is_empty());
     }
 
     #[test]
@@ -2875,6 +3220,221 @@ mod tests {
         assert!(a.selected_track().is_none());
         press_wait(&mut a, KeyCode::Char('L'));
         assert_eq!(a.current_track().unwrap().liked, !playing.liked);
+    }
+
+    #[test]
+    fn cover_backfill_does_not_change_playback_or_apply_to_a_new_track() {
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        let mut first = a.current_track().unwrap().clone();
+        let status = format!("{:?}", a.status);
+        first.cover_uri = Some("avatars.yandex.net/get-music-content/first/%%".into());
+        a.finish_track_cover(&first.id.clone(), Ok(Outcome::Track(Some(first.clone()))));
+        assert_eq!(a.media_snapshot().track.unwrap().cover_uri, first.cover_uri);
+        assert_eq!(format!("{:?}", a.status), status);
+        assert_eq!(a.player.state(), PlayerState::Playing);
+        a.finish_track_cover(&first.id, Err(anyhow::anyhow!("offline")));
+        assert_eq!(format!("{:?}", a.status), status);
+        press_wait(&mut a, KeyCode::Char('n'));
+        let second = a.current_track().unwrap().clone();
+        assert_ne!(second.id, first.id);
+        a.finish_track_cover(&first.id.clone(), Ok(Outcome::Track(Some(first))));
+        assert_eq!(a.current_track().unwrap().cover_uri, second.cover_uri);
+        assert_eq!(a.media_snapshot().track.unwrap().id, second.id);
+    }
+
+    #[test]
+    fn system_seek_preserves_pause_queue_and_prompt_and_clamps() {
+        use crate::media::Command;
+        let mut a = app();
+        assert!(!a.media_snapshot().can_seek);
+        a.on_media_command(Command::Seek(Duration::from_secs(42)));
+        assert_eq!(a.player.position(), Duration::ZERO);
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Down);
+        let queue = a.queue.clone();
+        let cursor = a.selected;
+        a.query = Some("still searching".into());
+        a.on_media_command(Command::Seek(Duration::from_millis(42500)));
+        assert!(a.player.position() >= Duration::from_millis(42500));
+        assert!(a.player.position() < Duration::from_secs(43));
+        assert_eq!(a.player.state(), PlayerState::Playing);
+        a.on_media_command(Command::Pause);
+        a.on_media_command(Command::Seek(Duration::from_secs(17)));
+        assert_eq!(a.player.position(), Duration::from_secs(17));
+        assert_eq!(a.player.state(), PlayerState::Paused);
+        let duration = a.current_track().unwrap().duration();
+        a.on_media_command(Command::Seek(Duration::MAX));
+        assert_eq!(a.player.position(), duration);
+        a.on_media_command(Command::Seek(Duration::ZERO));
+        assert_eq!(a.player.position(), Duration::ZERO);
+        assert_eq!(a.queue, queue);
+        assert_eq!(a.selected, cursor);
+        assert_eq!(a.query.as_deref(), Some("still searching"));
+        a.likes_waiting = true;
+        assert!(!a.media_snapshot().can_seek);
+        a.on_media_command(Command::Seek(Duration::from_secs(42)));
+        assert_eq!(a.player.position(), Duration::ZERO);
+    }
+
+    #[test]
+    fn system_play_pause_are_idempotent_and_work_inside_prompts() {
+        use crate::media::Command;
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Down);
+        let queue = a.queue.clone();
+        let entries = a.entries.clone();
+        a.query = Some("unfinished search".into());
+        a.help = true;
+        a.link_dialog = Some(LinkDialog { input: "123".into(), error: None, loading: false });
+        for _ in 0..2 { a.on_media_command(Command::Play); }
+        assert_eq!(a.player.state(), PlayerState::Playing);
+        for _ in 0..2 { a.on_media_command(Command::Pause); }
+        assert_eq!(a.player.state(), PlayerState::Paused);
+        a.on_media_command(Command::Toggle);
+        assert_eq!(a.player.state(), PlayerState::Playing);
+        a.on_media_command(Command::Toggle);
+        assert_eq!(a.player.state(), PlayerState::Paused);
+        a.on_media_command(Command::Play);
+        assert_eq!(a.player.state(), PlayerState::Playing);
+        assert_eq!(a.queue, queue);
+        assert_eq!(a.entries, entries);
+        assert_eq!(a.selected, 1);
+        assert_eq!(a.query.as_deref(), Some("unfinished search"));
+        assert_eq!(a.link_dialog.as_ref().unwrap().input, "123");
+        assert!(a.help);
+    }
+
+    #[test]
+    fn system_next_previous_use_the_playing_queue_without_moving_selection() {
+        use crate::media::Command;
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Down);
+        a.query = Some("search".into());
+        a.on_media_command(Command::Next);
+        settle(&mut a);
+        assert_eq!(a.queue_pos, Some(1));
+        a.on_media_command(Command::Previous);
+        settle(&mut a);
+        assert_eq!(a.queue_pos, Some(0));
+        assert_eq!(a.selected, 1);
+        assert_eq!(a.query.as_deref(), Some("search"));
+        assert_eq!(a.player.state(), PlayerState::Playing);
+    }
+
+    #[test]
+    fn system_pause_during_buffering_is_applied_when_the_stream_arrives() {
+        use crate::media::{Command, State};
+        for play in [false, true] {
+            let fake = FakeService::parked();
+            let gate = fake.gate();
+            let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+            press_wait(&mut a, KeyCode::Char('l'));
+            gate.hold();
+            press(&mut a, KeyCode::Enter);
+            assert!(a.net.loading_stream());
+            a.on_media_command(Command::Pause);
+            a.on_media_command(Command::Pause);
+            assert_eq!(a.media_snapshot().state, State::Paused);
+            if play {
+                a.on_media_command(Command::Play);
+                a.on_media_command(Command::Play);
+                assert_eq!(a.media_snapshot().state, State::Playing);
+            }
+            gate.release();
+            settle(&mut a);
+            assert_eq!(a.player.state(), if play { PlayerState::Playing } else { PlayerState::Paused });
+            assert_eq!(a.queue_pos, Some(0));
+        }
+    }
+
+    #[test]
+    fn system_play_during_restore_preserves_saved_track_seek_and_pause_intent() {
+        use crate::media::Command;
+        let mut a = app();
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        press_wait(&mut a, KeyCode::Char('n'));
+        a.player.seek(Duration::from_secs(42));
+        for play in [false, true] {
+            let fake = FakeService::parked();
+            let gate = fake.gate();
+            gate.hold();
+            let mut b = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+            b.restore(a.snapshot());
+            b.on_media_command(Command::Play);
+            b.on_media_command(Command::Play);
+            if !play {
+                b.on_media_command(Command::Pause);
+                b.on_media_command(Command::Pause);
+            }
+            gate.release();
+            settle(&mut b);
+            assert_eq!(b.queue_pos, Some(1));
+            assert_eq!(b.selected, 0);
+            assert_eq!(b.player.position().as_secs(), 42);
+            assert_eq!(b.player.state(), if play { PlayerState::Playing } else { PlayerState::Paused });
+        }
+    }
+
+    #[test]
+    fn now_playing_metadata_follows_audio_not_the_selected_row() {
+        use crate::media::State;
+        let mut a = app();
+        assert_eq!(a.media_snapshot().state, State::Stopped);
+        a.on_media_command(crate::media::Command::Pause);
+        assert!(a.media_snapshot().track.is_none());
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        let playing = a.current_track().unwrap().clone();
+        press(&mut a, KeyCode::Down);
+        a.player.seek(Duration::from_secs(42));
+        let snapshot = a.media_snapshot();
+        let metadata = snapshot.track.unwrap();
+        assert_eq!(metadata.id, playing.id);
+        assert_eq!(metadata.title, playing.title);
+        assert_eq!(metadata.artist, playing.artist);
+        assert_eq!(metadata.duration, playing.duration());
+        assert_eq!(snapshot.position.as_secs(), 42);
+        assert_eq!(snapshot.state, State::Playing);
+        a.on_media_command(crate::media::Command::Pause);
+        assert_eq!(a.media_snapshot().state, State::Paused);
+        a.play_at(None);
+        let stopped = a.media_snapshot();
+        assert_eq!(stopped.state, State::Stopped);
+        assert!(stopped.track.is_none());
+        assert!(!stopped.can_navigate);
+    }
+
+    #[test]
+    fn system_pause_survives_waiting_for_the_next_likes_page() {
+        use crate::media::Command;
+        let fake = FakeService::default().with_liked_tracks(350);
+        let gate = crate::testing::Park::default();
+        gate.hold();
+        fake.likes_log.lock().unwrap().next_gate = Some(gate.clone());
+        let mut a = App::new(Box::new(fake), Box::new(SimPlayer::default()), Lang::Ru);
+        press_wait(&mut a, KeyCode::Char('l'));
+        press_wait(&mut a, KeyCode::Enter);
+        a.play_at(Some(99));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while (a.player.state() != PlayerState::Playing || gate.calls() == 0) && Instant::now() < deadline {
+            a.tick(); std::thread::sleep(Duration::from_millis(2));
+        }
+        a.player.seek(a.current_track().unwrap().duration());
+        a.tick();
+        assert!(a.likes_waiting);
+        a.on_media_command(Command::Pause);
+        gate.release();
+        settle(&mut a);
+        assert_eq!(a.current_track().unwrap().id, "101");
+        assert_eq!(a.player.state(), PlayerState::Paused);
     }
 
     #[test]

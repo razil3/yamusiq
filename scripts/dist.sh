@@ -1,50 +1,63 @@
 #!/bin/sh
-# Build the macOS binaries and pack them into a release.
-#
-#   scripts/dist.sh              -> dist/yamusiq-<version>-{arm64,x86_64,universal}.tar.gz + SHA256SUMS
-#
-# The per-architecture archives are what GitHub Releases should carry; the
-# universal one is for handing around locally. Every archive holds a single file
-# named "yamusiq" and the checksums cover all three.
+# Usage: sh scripts/dist.sh [--smoke-test] [--output <directory>]
+# Default: build arm64, x86_64 and universal bundles, archives and SHA256SUMS.
+# --smoke-test builds/packages only the host target, using temporary output
+# unless --output is supplied. Nothing here publishes a release.
 set -eu
-cd "$(dirname "$0")/.."
-
-NAME="yamusiq"
-VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-OUT="dist"
-TARGETS="aarch64-apple-darwin x86_64-apple-darwin"
-
-for target in $TARGETS; do
+. "$(dirname "$0")/macos-common.sh"
+smoke=false
+out=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --smoke-test) smoke=true; shift ;;
+        --output) [ "$#" -ge 2 ] && [ -n "$2" ] || fail '--output needs a directory'; out="$2"; shift 2 ;;
+        --help|-h) sed -n '2,5p' "$0"; exit 0 ;;
+        *) fail "unknown option: $1" ;;
+    esac
+done
+work="$(mktemp -d "${TMPDIR:-/tmp}/yamusiq-dist.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+trap 'exit 1' HUP INT TERM
+if [ -z "$out" ]; then
+    if "$smoke"; then out="$work/output"; else out="$root/dist"; fi
+fi
+# Resolve relative output paths before changing into the repository.
+mkdir -p "$out"
+out="$(CDPATH= cd -- "$out" && pwd)"
+[ ! -e "$out/SHA256SUMS" ] && [ ! -L "$out/SHA256SUMS" ] || fail 'output already contains SHA256SUMS; use a fresh --output directory'
+cd "$root"
+target_dir="${CARGO_TARGET_DIR:-$root/target}"
+host="$(rustc -vV | awk '$1 == "host:" {print $2}')"
+targets='aarch64-apple-darwin x86_64-apple-darwin'
+if "$smoke"; then targets="$host"; fi
+arches=
+for target in $targets; do
     case "$target" in
         aarch64-apple-darwin) arch=arm64 ;;
         x86_64-apple-darwin) arch=x86_64 ;;
-        *) echo "unknown target $target" >&2; exit 1 ;;
+        *) fail "unsupported target: $target" ;;
     esac
-
-    cargo build --release --target "$target"
-    stage="$(mktemp -d)"
-    cp "target/$target/release/$NAME" "$stage/$NAME"
-    mkdir -p "$OUT"
-    tar -czf "$OUT/$NAME-$VERSION-$arch.tar.gz" -C "$stage" "$NAME"
-    rm -rf "$stage"
-    echo "packed $OUT/$NAME-$VERSION-$arch.tar.gz"
+    [ ! -e "$out/yamusiq-$version-$arch.tar.gz" ] && [ ! -L "$out/yamusiq-$version-$arch.tar.gz" ] || fail "archive already exists for $arch"
+    arches="$arches $arch"
 done
-
-# Both halves in one file: runs natively on either Mac, no Rosetta needed on
-# Apple Silicon. Not a substitute for the per-architecture archives, but handy.
-lipo -create -output "$OUT/$NAME-$VERSION-universal" \
-    target/aarch64-apple-darwin/release/$NAME \
-    target/x86_64-apple-darwin/release/$NAME
-stage="$(mktemp -d)"
-cp "$OUT/$NAME-$VERSION-universal" "$stage/$NAME"
-tar -czf "$OUT/$NAME-$VERSION-universal.tar.gz" -C "$stage" "$NAME"
-rm -rf "$stage"
-rm -f "$OUT/$NAME-$VERSION-universal"
-echo "packed $OUT/$NAME-$VERSION-universal.tar.gz"
-
-# Only include this release, even when dist still holds older archives.
-: > "$OUT/SHA256SUMS"
-for arch in arm64 x86_64 universal; do
-    (cd "$OUT" && shasum -a 256 "$NAME-$VERSION-$arch.tar.gz") >> "$OUT/SHA256SUMS"
+if ! "$smoke"; then
+    [ ! -e "$out/yamusiq-$version-universal.tar.gz" ] && [ ! -L "$out/yamusiq-$version-universal.tar.gz" ] || fail 'universal archive already exists'
+fi
+for target in $targets; do
+    case "$target" in aarch64-apple-darwin) arch=arm64 ;; x86_64-apple-darwin) arch=x86_64 ;; esac
+    cargo build --release --locked --target "$target"
+    sh "$root/scripts/pack.sh" "$target_dir/$target/release/yamusiq" "$arch" "$out/yamusiq-$version-$arch.tar.gz"
 done
-echo "wrote $OUT/SHA256SUMS"
+if ! "$smoke"; then
+    /usr/bin/lipo -create -output "$work/yamusiq-universal" \
+        "$target_dir/aarch64-apple-darwin/release/yamusiq" \
+        "$target_dir/x86_64-apple-darwin/release/yamusiq"
+    sh "$root/scripts/pack.sh" "$work/yamusiq-universal" universal "$out/yamusiq-$version-universal.tar.gz"
+    arches="$arches universal"
+fi
+# Relative names make `shasum -a 256 -c SHA256SUMS` work after downloading.
+for arch in $arches; do
+    (cd "$out" && shasum -a 256 "yamusiq-$version-$arch.tar.gz") >> "$out/SHA256SUMS"
+done
+(cd "$out" && shasum -a 256 -c SHA256SUMS)
+echo "verified distribution: $out"

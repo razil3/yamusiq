@@ -17,6 +17,9 @@ pub struct Track {
     /// Main (first) artist's id, for the artist views.
     #[serde(default)]
     pub artist_id: Option<String>,
+    /// Yandex image URI template, resolved only by the artwork worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_uri: Option<String>,
 }
 
 impl Track {

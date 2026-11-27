@@ -5,12 +5,8 @@ use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
-    symbols::Marker,
     text::{Line, Span},
-    widgets::{
-        canvas::{Canvas, Line as CanvasLine},
-        Paragraph,
-    },
+    widgets::Paragraph,
     Frame,
 };
 
@@ -123,7 +119,7 @@ pub(super) fn header(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
         Line::from(Span::styled("y a m u s i q", Style::default().fg(p.accent).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled(t.tagline, Style::default().fg(p.text))),
         Line::from(Span::styled(
-            format!("{} · v{}", app.service.name(), env!("CARGO_PKG_VERSION")),
+            app.service.name(),
             Style::default().fg(p.muted),
         )),
     ];
@@ -242,41 +238,9 @@ pub(super) fn thin_bar(buf: &mut Buffer, area: Rect, ratio: f64, p: &Palette) {
     }
 }
 
-/// Signal history as a single smooth braille line.
-pub(super) fn signal(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
-    if inner.width < 2 || inner.height == 0 {
-        return;
-    }
-    let w = f64::from(inner.width) * 2.0;
-    let h = f64::from(inner.height) * 4.0;
-    let hist = &app.history;
-    let samples = (w as usize).min(hist.len());
-    let start = hist.len() - samples;
-    let pts: Vec<(f64, f64)> = hist[start..]
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i as f64 * w / samples.max(1) as f64, 0.5 + (*v).min(100) as f64 / 100.0 * (h - 1.5)))
-        .collect();
-    let (text, bg) = (p.text, p.bg);
-    frame.render_widget(
-        Canvas::default()
-            .marker(Marker::Braille)
-            .background_color(bg)
-            .x_bounds([0.0, w])
-            .y_bounds([0.0, h])
-            .paint(move |ctx| {
-                for pair in pts.windows(2) {
-                    let ((x1, y1), (x2, y2)) = (pair[0], pair[1]);
-                    ctx.draw(&CanvasLine { x1, y1, x2, y2, color: text });
-                }
-            }),
-        inner,
-    );
-}
-
 /// Wrap at whitespace boundaries only; a word wider than the column stays
 /// intact for the renderer to ellipsize, never split into multiple rows.
-fn wrap_words(text: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let mut rows = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
@@ -306,14 +270,16 @@ pub(super) fn info(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
     // Rows in priority order: when the card is short, the tail is cut, so
     // what matters most (title, artist, quality) comes first.
     let mut lines = Vec::new();
+    let mut heading_end = 2;
     match app.current_track() {
         Some(tr) => {
-            let mut title = vec![Span::styled(tr.title.clone(), Style::default().fg(p.accent).add_modifier(Modifier::BOLD))];
-            if app.is_saved(tr) {
-                title.push(Span::styled(" ⇣", Style::default().fg(p.text)));
+            let title = format!("{}{}", tr.title, if app.is_saved(tr) { " ⇣" } else { "" });
+            for text in wrap_words(&title, usize::from(inner.width)) {
+                lines.push(Line::from(Span::styled(ellipsize(&text, usize::from(inner.width)),
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD))));
             }
-            lines.push(Line::from(title));
             lines.push(Line::from(Span::styled(tr.artist.clone(), Style::default().fg(p.text))));
+            heading_end = lines.len();
             if let Some(q) = &app.quality {
                 lines.push(row(keys[2], q.clone()));
                 if app.lossless_missing {
@@ -351,7 +317,6 @@ pub(super) fn info(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
                     lines.push(Line::from(Span::styled(ellipsize(&text, width), Style::default().fg(p.text))));
                 }
             }
-            lines.push(row(keys[1], format_time(tr.duration())));
         }
         None => {
             lines.push(Line::from(Span::styled(t.not_playing, Style::default().fg(p.accent).add_modifier(Modifier::BOLD))));
@@ -359,10 +324,35 @@ pub(super) fn info(frame: &mut Frame, inner: Rect, app: &App, p: &Palette) {
         }
     }
     lines.push(row(keys[3], quiet(app.mode.label(app.lang))));
-    lines.push(row(keys[4], quiet(state_label(app))));
+    // Stack artwork above the complete text card. Height may limit its size,
+    // but never reserve a narrow text column beside the image or crop metadata.
+    if let Some(tr) = app.current_track()
+        && let Some((id, preview)) = &app.cover_preview
+        && id == &tr.id
+    {
+        let available_rows = usize::from(inner.height).saturating_sub(lines.len() + 1);
+        let rows = available_rows.min(usize::from(inner.width).div_ceil(2));
+        let width = usize::from(inner.width).min(rows * 2);
+        if width >= 10 && rows >= 5 {
+            let offset = (usize::from(inner.width) - width) / 2;
+            for y in 0..rows { for x in 0..width {
+                let (glyph, fg, bg) = preview.cell(x, y, width, rows);
+                let mut utf8 = [0; 4];
+                frame.buffer_mut()[(inner.x + (offset + x) as u16, inner.y + y as u16)]
+                    .set_symbol(glyph.encode_utf8(&mut utf8)).set_style(Style::default()
+                        .fg(ratatui::style::Color::Rgb(fg, fg, fg))
+                        .bg(ratatui::style::Color::Rgb(bg, bg, bg)));
+            } }
+            let text_y = rows as u16 + 1;
+            frame.render_widget(Paragraph::new(lines), Rect {
+                y: inner.y + text_y, height: inner.height - text_y, ..inner
+            });
+            return;
+        }
+    }
     // A breathing line under the title block, only when there is room for it.
     if lines.len() < usize::from(inner.height) {
-        lines.insert(2, Line::from(""));
+        lines.insert(heading_end, Line::from(""));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }

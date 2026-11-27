@@ -1,0 +1,4 @@
+# Keep Cargo builds and the app's LSMinimumSystemVersion in agreement.
+# scripts/macos-common.sh reads this value as the packaging policy as well.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "11.0"

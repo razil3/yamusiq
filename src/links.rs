@@ -60,7 +60,7 @@ mod tests {
     fn shared_url_is_public_and_round_trips() {
         let track = crate::model::Track {
             id: "123".into(), album_id: Some("456".into()), title: "test".into(), artist: "test".into(),
-            album: "test".into(), duration_secs: 1, liked: false, cached: false, artist_id: None,
+            album: "test".into(), duration_secs: 1, liked: false, cached: false, artist_id: None, cover_uri: None,
         };
         let public = track_url(&track).unwrap();
         assert_eq!(public, "https://music.yandex.ru/album/456/track/123");

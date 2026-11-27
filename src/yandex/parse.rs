@@ -70,6 +70,9 @@ pub fn track(v: &Value) -> Option<Track> {
         cached: false,
         album_id,
         artist_id,
+        cover_uri: v.get("coverUri").and_then(Value::as_str).filter(|s| !s.is_empty())
+            .or_else(|| album.and_then(|a| a.get("coverUri")?.as_str()).filter(|s| !s.is_empty()))
+            .map(str::to_owned),
     })
 }
 
@@ -91,6 +94,32 @@ pub fn playlist(v: &Value, fallback_owner: u64) -> Option<Playlist> {
         title: v.get("title")?.as_str()?.to_string(),
         track_count: v.get("trackCount").and_then(Value::as_u64).unwrap_or(0) as usize,
     })
+}
+
+/// Personal landing entities are wrappers around ordinary playlist metadata.
+/// Match stable generated types, never translated or user-editable titles.
+pub fn home_playlists(result: &Value, owner: u64) -> Vec<crate::home::Recommendation> {
+    use crate::home::{Kind, Recommendation};
+    let mut found = Vec::new();
+    for block in result.get("blocks").and_then(Value::as_array).into_iter().flatten() {
+        if block.get("type").and_then(Value::as_str) != Some("personal-playlists") { continue; }
+        for entity in block.get("entities").and_then(Value::as_array).into_iter().flatten() {
+            if entity.get("type").and_then(Value::as_str) != Some("personal-playlist") { continue; }
+            let Some(wrapper) = entity.get("data") else { continue };
+            if wrapper.get("ready").and_then(Value::as_bool) == Some(false) { continue; }
+            let Some(data) = wrapper.get("data") else { continue };
+            let Some(kind) = data.get("generatedPlaylistType").or_else(|| wrapper.get("type"))
+                .and_then(Value::as_str).and_then(Kind::from_api) else { continue };
+            if found.iter().any(|p: &Recommendation| p.kind == kind) { continue; }
+            let Some(playlist) = playlist(data, owner) else { continue };
+            let cover_uri = data.pointer("/coverWithoutText/uri").and_then(Value::as_str)
+                .or_else(|| data.pointer("/cover/uri").and_then(Value::as_str))
+                .filter(|s| !s.is_empty()).map(str::to_owned);
+            found.push(Recommendation { kind, playlist, cover_uri });
+        }
+    }
+    found.sort_by_key(|p| Kind::ALL.iter().position(|k| *k == p.kind).unwrap_or(3));
+    found
 }
 
 /// Lyrics request signature: base64(HMAC-SHA256(key, "{track_id}{timestamp}")).
@@ -179,6 +208,41 @@ pub fn best_download_info(result: &Value) -> Option<(String, String, u32)> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn home_personal_playlists_are_typed_ordered_and_keep_cover_metadata() {
+        use serde_json::json;
+        use crate::home::Kind;
+        let entity = |kind: &str, id: u64| json!({"type": "personal-playlist", "data": {
+            "type": kind, "ready": true, "data": {
+                "kind": id, "uid": 42, "title": "A translated title", "trackCount": 25,
+                "generatedPlaylistType": kind,
+                "coverWithoutText": {"uri": "music-avatars.music.yandex.net/get-music-user-playlist/1/a/%%?123"}
+            }
+        }});
+        let stash = entity("missedLikes", 3);
+        let result = json!({"blocks": [{"type": "personal-playlists", "entities": [
+            entity("recentTracks", 9), stash.clone(), entity("playlistOfTheDay", 2), entity("neverHeard", 1), stash
+        ]}]});
+        let cards = super::home_playlists(&result, 999);
+        assert_eq!(cards.iter().map(|p| p.kind).collect::<Vec<_>>(), Kind::ALL);
+        assert_eq!(cards[0].playlist.id, "42:1");
+        assert_eq!(cards[1].playlist.track_count, 25);
+        assert!(cards.iter().all(|p| p.cover_uri.as_deref().unwrap().ends_with("?123")));
+    }
+
+    #[test]
+    fn home_ignores_unready_unknown_and_malformed_entities() {
+        use serde_json::json;
+        let result = json!({"blocks": [{"type": "personal-playlists", "entities": [
+            {"type": "personal-playlist", "data": {"type": "neverHeard", "ready": false, "data": {"kind": 1, "title": "Not ready"}}},
+            {"type": "personal-playlist", "data": {"type": "unknown", "data": {"kind": 2, "title": "Other"}}},
+            {"type": "personal-playlist", "data": {"type": "playlistOfTheDay", "data": {"title": "No id"}}},
+            {"type": "other", "data": {"type": "missedLikes", "data": {"kind": 3, "title": "Not a playlist"}}}
+        ]}]});
+        assert!(super::home_playlists(&result, 1).is_empty());
+        assert!(super::home_playlists(&json!({}), 1).is_empty());
+    }
     use super::*;
     use serde_json::json;
 
@@ -198,6 +262,23 @@ mod tests {
         assert!(track(&json!({"id": 1, "title": "x", "available": false})).is_none());
         let bare = track(&json!({"id": 7, "title": "x"})).unwrap();
         assert_eq!((bare.id.as_str(), bare.artist.as_str(), bare.album_id), ("7", "—", None));
+    }
+
+    #[test]
+    fn cover_metadata_prefers_track_then_album_and_old_tracks_still_load() {
+        let mut v = json!({"id": 1, "title": "Song", "coverUri": "track/%%",
+            "albums": [{"id": 2, "coverUri": "album/%%"}]});
+        assert_eq!(track(&v).unwrap().cover_uri.as_deref(), Some("track/%%"));
+        v["coverUri"] = "".into();
+        assert_eq!(track(&v).unwrap().cover_uri.as_deref(), Some("album/%%"));
+        v.as_object_mut().unwrap().remove("coverUri");
+        assert_eq!(track(&v).unwrap().cover_uri.as_deref(), Some("album/%%"));
+        let old = track(&json!({"id": 3, "title": "Old"})).unwrap();
+        let mut saved = serde_json::to_value(&old).unwrap();
+        saved.as_object_mut().unwrap().remove("cover_uri");
+        assert!(serde_json::from_value::<Track>(saved).unwrap().cover_uri.is_none());
+        let restored: Track = serde_json::from_value(serde_json::to_value(track(&v).unwrap()).unwrap()).unwrap();
+        assert_eq!(restored.cover_uri.as_deref(), Some("album/%%"));
     }
 
     #[test]

@@ -145,7 +145,7 @@ mod tests {
             liked: false,
             cached: false,
             album_id: None,
-            artist_id: None,
+            artist_id: None, cover_uri: None,
         }
     }
 

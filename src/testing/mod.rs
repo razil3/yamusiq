@@ -87,6 +87,7 @@ pub struct FakeService {
     action_park: Option<Park>,
     pub radio: Arc<Mutex<RadioLog>>,
     pub likes_log: Arc<Mutex<LikesLog>>,
+    pub home_fail: Arc<AtomicBool>,
 }
 
 fn pl(id: &str, title: &str, ids: &[&str]) -> (Playlist, Vec<String>) {
@@ -104,7 +105,7 @@ fn t(id: &str, title: &str, artist: &str, album: &str, secs: u32, liked: bool, c
         liked,
         cached,
         album_id: None,
-        artist_id: None,
+        artist_id: None, cover_uri: None,
     }
 }
 
@@ -131,7 +132,7 @@ impl Default for FakeService {
             pl("p2", "Фокус", &["6", "7", "4", "5"]),
             pl("p3", "По-русски", &["11", "12", "13", "14"]),
         ];
-        Self { tracks: Arc::new(Mutex::new(tracks)), playlists, park: Park::default(), reject_likes: false, stream_park: None, action_park: None, radio: Arc::default(), likes_log: Arc::default() }
+        Self { tracks: Arc::new(Mutex::new(tracks)), playlists, park: Park::default(), reject_likes: false, stream_park: None, action_park: None, radio: Arc::default(), likes_log: Arc::default(), home_fail: Arc::default() }
     }
 }
 
@@ -180,6 +181,14 @@ impl MusicService for FakeService {
         Ok(self.filter(|t| {
             normalize(&t.title).contains(&q) || normalize(&t.artist).contains(&q) || normalize(&t.album).contains(&q)
         }))
+    }
+
+    fn home_playlists(&self) -> Result<Vec<crate::home::Recommendation>> {
+        self.park.pass(GATE_TIMEOUT);
+        if self.home_fail.load(Ordering::SeqCst) { bail!("test home unavailable"); }
+        Ok(crate::home::Kind::ALL.into_iter().zip(self.playlists.iter().cycle()).map(|(kind, (p, _))| {
+            crate::home::Recommendation { kind, playlist: p.clone(), cover_uri: None }
+        }).collect())
     }
 
     fn playlists(&self) -> Result<Vec<Playlist>> {
@@ -297,7 +306,7 @@ impl MusicService for FakeService {
     fn clone_boxed(&self) -> Box<dyn MusicService> {
         // The gate is shared on purpose: a test holds one gate and both the
         // worker's copy and its own copy obey it.
-        Box::new(Self { tracks: self.tracks.clone(), playlists: self.playlists.clone(), park: self.park.clone(), reject_likes: self.reject_likes, stream_park: self.stream_park.clone(), action_park: self.action_park.clone(), radio: self.radio.clone(), likes_log: self.likes_log.clone() })
+        Box::new(Self { tracks: self.tracks.clone(), playlists: self.playlists.clone(), park: self.park.clone(), reject_likes: self.reject_likes, stream_park: self.stream_park.clone(), action_park: self.action_park.clone(), radio: self.radio.clone(), likes_log: self.likes_log.clone(), home_fail: self.home_fail.clone() })
     }
 }
 

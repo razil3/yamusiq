@@ -1,0 +1,43 @@
+name: macOS bundle smoke
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Check shell syntax
+        run: |
+          for script in scripts/*.sh assets/macos/Launch.command assets/macos/cli-launcher; do
+            sh -n "$script"
+          done
+
+      - name: Test Rust modules and terminal window layout
+        run: |
+          cargo test --locked
+          node --test scripts/test-window-layout.cjs
+
+      - name: Build and round-trip a native app archive
+        run: sh scripts/dist.sh --smoke-test
+
+      - name: Test rejection of invalid app bundles
+        run: |
+          host="$(rustc -vV | awk '$1 == "host:" {print $2}')"
+          sh scripts/test-packaging.sh "target/$host/release/yamusiq"

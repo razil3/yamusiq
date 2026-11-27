@@ -23,13 +23,16 @@ pub enum Job {
     RadioNext { generation: u64, station: String, queue: String },
     Feedback { sequence: u64, event: crate::radio::Feedback },
     OpenTrack { id: String },
+    /// Backfill artwork metadata for tracks restored from an older session.
+    TrackCover { id: String },
     CopyLink { url: String },
     SyncLikes,
     Likes,
     LikesMore { cursor: crate::likes::Cursor },
     Cached,
     Playlists,
-    PlaylistTracks { id: String, title: String },
+    HomePlaylists,
+    PlaylistTracks { id: String, title: String, personal: Option<crate::home::Kind> },
     Search { query: String },
     /// Play `track`; the worker resolves the stream (or plays a saved copy).
     Stream { track: Track, quality: crate::model::Quality, position: usize },
@@ -63,7 +66,7 @@ impl Job {
         match self {
             Self::Stream { .. } | Self::QualityStream { .. } | Self::OpenTrack { .. } => Group::Playback,
             Self::Wave | Self::TrackWave { .. } | Self::RadioMore { .. } | Self::RadioNext { .. } | Self::Feedback { .. } => Group::Radio,
-            Self::Lyrics { .. } => Group::Metadata,
+            Self::Lyrics { .. } | Self::TrackCover { .. } => Group::Metadata,
             Self::Like { .. } | Self::CopyLink { .. } => Group::Actions,
             Self::SyncLikes | Self::SaveStream { .. } | Self::SyncStream { .. } => Group::Downloads,
             _ => Group::Catalogue,
@@ -84,6 +87,7 @@ impl Job {
             Self::CopyLink { .. } => "clipboard".into(),
             Self::Stream { .. } | Self::QualityStream { .. } => "playback".into(),
             Self::Lyrics { .. } => "lyrics".into(),
+            Self::TrackCover { .. } => "track-cover".into(),
             Self::Like { track_id, .. } => format!("like:{track_id}"),
             Self::SaveStream { track, .. } => format!("save:{}", track.id),
             Self::SyncStream { track, .. } => format!("sync:{}", track.id),
@@ -110,6 +114,7 @@ pub enum Outcome {
     Track(Option<Track>),
     Ack,
     Playlists(Vec<crate::model::Playlist>),
+    HomePlaylists(Vec<crate::home::Recommendation>),
     /// A playable source, or none when the backend has no audio for the track.
     Stream(Option<crate::model::Stream>),
     Lyrics(Option<crate::model::Lyrics>),
@@ -278,13 +283,14 @@ fn run(service: &mut dyn MusicService, job: &Job, context: &RequestContext) -> a
         Job::RadioMore { station, queue, known, target, .. } => Outcome::RadioWindow(crate::radio::load_window(service, station, Some(queue), known, *target, context)?),
         Job::RadioNext { station, queue, .. } => Outcome::Radio(service.radio_batch(station, Some(queue))?),
         Job::Feedback { event, .. } => { service.radio_feedback(event)?; Outcome::Ack }
-        Job::OpenTrack { id } => Outcome::Track(service.track(id)?),
+        Job::OpenTrack { id } | Job::TrackCover { id } => Outcome::Track(service.track(id)?),
         Job::CopyLink { url } => { crate::links::copy(url)?; Outcome::Ack }
         Job::SyncLikes => Outcome::Tracks(service.likes_with_context(true, context)?),
         Job::Likes => Outcome::LikesPage(service.likes_page(None, 0, context)?),
         Job::LikesMore { cursor } => Outcome::LikesPage(service.likes_page(Some(&cursor.refs), cursor.next, context)?),
         Job::Cached => Outcome::Tracks(service.cached()?),
         Job::Playlists => Outcome::Playlists(service.playlists()?),
+        Job::HomePlaylists => Outcome::HomePlaylists(service.home_playlists()?),
         Job::PlaylistTracks { id, .. } => Outcome::Tracks(service.playlist_tracks(id)?),
         Job::Search { query } => Outcome::Tracks(service.search(query)?),
         Job::Stream { track, quality, .. } => Outcome::Stream(service.stream_with_context(&track.id, *quality, context)?),

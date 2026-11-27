@@ -6,6 +6,7 @@
 //! hints); thin line-work instead of solid blocks; sentence-case labels.
 
 mod parts;
+mod home;
 mod visualizer;
 
 use ratatui::{
@@ -184,20 +185,22 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
     parts::bands(frame, inner, app, p);
     draw_meters(frame, [bcol[1], bcol[2], bcol[3]], app, p);
 
-    // Column C: library, signal trace, track card.
+    // Column C: library and track card.
     let ccol = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(Section::ALL.len() as u16 + 2), Constraint::Length(6), Constraint::Min(6)])
+        .constraints([Constraint::Length(Section::ALL.len() as u16 + 2), Constraint::Min(6)])
         .spacing(1)
         .split(cols[2]);
     draw_library(frame, ccol[0], app, p);
-    let inner = hud_panel(frame, ccol[1], t.lbl_signal, t.hint_signal, false, p);
-    parts::signal(frame, inner, app, p);
-    let inner = hud_panel(frame, ccol[2], t.lbl_info, t.hint_info, false, p);
+    let inner = hud_panel(frame, ccol[1], t.lbl_info, t.hint_info, false, p);
     parts::info(frame, inner, app, p);
 }
 
 fn draw_list(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
+    if app.list == crate::app::ListKind::Overview {
+        home::draw(frame, area, app, p);
+        return;
+    }
     let t = app.lang.t();
     let focused = app.focus == Focus::List;
     let playlists = matches!(app.list, crate::app::ListKind::Playlists);
@@ -209,7 +212,9 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App, p: &Palette) {
         t.hint_list
     };
     let back_hint = if app.can_back_to_likes() { Some(t.hint_back_likes) }
-        else if matches!(app.list, crate::app::ListKind::Playlist(_)) { Some(t.hint_back_playlists) }
+        else if matches!(app.list, crate::app::ListKind::Playlist(_) | crate::app::ListKind::HomePlaylist(_)) {
+            Some(if app.playlist_parent_is_home() { match app.lang { Lang::Ru => "Shift+← Главная", Lang::En => "Shift+← Home" } } else { t.hint_back_playlists })
+        }
         else { None };
     let back_width = if let Some(back_hint) = back_hint { (text_width(back_hint) as u16 + 2).min(area.width.saturating_sub(2)) } else { 0 };
     let available = usize::from(area.width.saturating_sub(4 + back_width));
@@ -702,7 +707,7 @@ mod tests {
         let mut a = app();
         let idle = render(&a, 130, 40);
         for needle in [
-            "Визуализатор", "Частоты", "16 кГц", "Уровень сигнала", "Данные трека", "Библиотека",
+            "Визуализатор", "Частоты", "16 кГц", "Данные трека", "Библиотека",
             "Громкость: 70%", "нет сигнала", "Ничего не играет", "y a m u s i q", "▄█████▄", "справка", "╭",
         ] {
             assert!(idle.contains(needle), "missing {needle:?}");
@@ -851,6 +856,112 @@ mod tests {
     }
 
     #[test]
+    fn experimental_cover_keeps_metadata_and_hides_in_small_or_stale_cards() {
+        let mut a = playing_at(10);
+        let id = a.current_track().unwrap().id.clone();
+        a.cover_preview = Some((id, std::sync::Arc::new(crate::cover::Preview::from_luma([128; crate::cover::SIDE * crate::cover::SIDE]))));
+        a.quality = Some("FLAC · lossless".into());
+        let is_cover = |symbol: &str| symbol.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c));
+        for (width, height, visible) in [(54, 24, true), (42, 20, true), (38, 18, true), (32, 14, true), (22, 10, false), (38, 7, false)] {
+            let area = ratatui::layout::Rect::new(2, 2, width, height);
+            let mut term = Terminal::new(TestBackend::new(width + 6, height + 4)).unwrap();
+            term.draw(|f| super::parts::info(f, area, &a, &PALETTE)).unwrap();
+            let buf = term.backend().buffer();
+            let content = buf.content().iter().map(|c| c.symbol()).collect::<String>();
+            assert_eq!(is_cover(&content), visible, "{width}x{height}");
+            assert!(content.contains("FLAC"));
+            if visible {
+                assert!(content.contains("lossless"));
+                assert!(!content.contains(a.lang.t().info_keys[1]));
+                assert!(!content.contains(a.lang.t().info_keys[4]));
+                assert!(content.contains(a.lang.t().info_keys[3]));
+                for y in 0..height+4 { assert!(!is_cover(buf[(area.x + width, y)].symbol())); }
+            }
+        }
+        a.cover_preview.as_mut().unwrap().0 = "another track".into();
+        let mut term = Terminal::new(TestBackend::new(38, 18)).unwrap();
+        term.draw(|f| super::parts::info(f, f.area(), &a, &PALETTE)).unwrap();
+        assert!(!term.backend().buffer().content().iter().any(|c| is_cover(c.symbol())));
+    }
+
+    #[test]
+    fn cover_uses_full_card_width_and_all_text_is_below_it() {
+        let mut a = playing_at(10);
+        let id = a.current_track().unwrap().id.clone();
+        a.cover_preview = Some((id, std::sync::Arc::new(crate::cover::Preview::from_luma([128; crate::cover::SIDE * crate::cover::SIDE]))));
+        a.quality = Some("FLAC · lossless".into());
+        a.lossless_missing = true;
+        let is_cover = |symbol: &str| symbol.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c));
+        for (width, height) in [(31u16, 40u16), (38, 44), (55, 50)] {
+            let area = ratatui::layout::Rect::new(3, 2, width, height);
+            let mut term = Terminal::new(TestBackend::new(width + 8, height + 6)).unwrap();
+            term.draw(|f| super::parts::info(f, area, &a, &PALETTE)).unwrap();
+            let buf = term.backend().buffer();
+            let rows = width.div_ceil(2);
+            for y in area.y..area.y + rows {
+                for x in area.x..area.x + width {
+                    assert!(is_cover(buf[(x, y)].symbol()), "{width}x{height}: cover fills width");
+                }
+            }
+            let text: String = (area.y + rows + 1..area.y + height)
+                .flat_map(|y| (area.x..area.x + width).map(move |x| buf[(x, y)].symbol())).collect();
+            assert!(text.contains(&a.current_track().unwrap().title));
+            assert!(text.contains(&a.current_track().unwrap().artist));
+            assert!(text.contains("lossless"));
+            assert!(text.contains(a.lang.t().lossless_missing));
+            assert!(!text.contains(a.lang.t().info_keys[1]));
+            assert!(!text.contains(a.lang.t().info_keys[4]));
+            assert!(text.contains(a.lang.t().info_keys[3]));
+            assert!(!is_cover(&text));
+            for y in 0..height + 6 {
+                assert_eq!(buf[(area.x - 1, y)].symbol(), " ");
+                assert_eq!(buf[(area.x + width, y)].symbol(), " ");
+            }
+        }
+    }
+
+    #[test]
+    fn track_title_wraps_without_losing_words_or_crossing_card_bounds() {
+        for title in ["Alpha Beta Gamma Delta Epsilon Zeta Eta Theta", "Очень длинное название трека с дополнительными словами", "夜空 星々 静かな 音楽 朝の 光と 夢の 世界"] {
+            for with_cover in [false, true] {
+                for width in [24u16, 35] {
+                    let mut a = playing_at(10);
+                    let track = &mut a.queue[a.queue_pos.unwrap()];
+                    track.title = title.into();
+                    track.artist = "Artist".into();
+                    track.cached = true;
+                    if with_cover {
+                        a.cover_preview = Some((track.id.clone(), std::sync::Arc::new(crate::cover::Preview::from_luma([128; crate::cover::SIDE * crate::cover::SIDE]))));
+                    }
+                    let area = ratatui::layout::Rect::new(3, 2, width, 46);
+                    let mut term = Terminal::new(TestBackend::new(width + 8, 52)).unwrap();
+                    term.draw(|f| super::parts::info(f, area, &a, &PALETTE)).unwrap();
+                    let buf = term.backend().buffer();
+                    let rows: Vec<String> = (area.y..area.y + area.height).map(|y| {
+                        let mut row = String::new();
+                        let mut x = area.x;
+                        while x < area.x + width {
+                            let symbol = buf[(x, y)].symbol();
+                            row.push_str(symbol);
+                            x += super::text_width(symbol).max(1) as u16;
+                        }
+                        row
+                    }).collect();
+                    let artist = rows.iter().position(|row| row.trim() == "Artist").unwrap();
+                    let first_word = title.split_whitespace().next().unwrap();
+                    let start = rows.iter().position(|row| row.trim_start().starts_with(first_word)).unwrap();
+                    let restored = rows[start..artist].iter().map(|row| row.trim()).collect::<Vec<_>>().join(" ");
+                    assert_eq!(restored, format!("{title} ⇣"), "width {width}, cover {with_cover}");
+                    assert!(artist - start > 1);
+                    for y in 0..52 {
+                        assert_eq!(buf[(area.x + width, y)].symbol(), " ");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn album_name_wraps_under_the_value_without_touching_neighbours() {
         let mut a = playing_at(10);
         a.queue[a.queue_pos.unwrap()].album = "Alpha Beta Gamma Delta Epsilon".into();
@@ -870,7 +981,7 @@ mod tests {
                 assert!(lines[album_row].contains("Alpha"));
                 let mut album = String::new();
                 for line in &lines[album_row..] {
-                    if line.contains(lang.t().info_keys[1]) { break; }
+                    if line.contains(lang.t().info_keys[3]) { break; }
                     let value: String = line.chars().skip(indent).collect();
                     if !album.is_empty() { album.push(' '); }
                     album.push_str(value.trim());
@@ -990,6 +1101,94 @@ mod tests {
         assert!(s.contains("Электричка уходит в шесть"));
     }
 
+    #[test]
+    fn opened_home_playlists_localize_panel_and_status_and_version_is_footer_only() {
+        let mut a = app();
+        for lang in [Lang::Ru, Lang::En] {
+            a.lang = lang;
+            for kind in crate::home::Kind::ALL {
+                a.list = crate::app::ListKind::HomePlaylist(kind);
+                a.status = crate::app::Status::Loaded(a.list.clone(), 60);
+                let terminal = term(&a, 160, 50);
+                let buf = terminal.backend().buffer();
+                let row = |y| (0..160).map(|x| buf[(x, y)].symbol()).collect::<String>();
+                let screen = render(&a, 160, 50);
+                let title = kind.title(lang);
+                assert!(screen.contains(&format!("Playlist: {title}")) || screen.contains(&format!("Плейлист: {title}")));
+                assert!(screen.contains(&a.status.text(lang)));
+                if lang == Lang::En { assert!(!screen.contains(kind.title(Lang::Ru))); }
+                let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+                for y in 0..3 { assert!(!row(y).contains(&version), "no version in the brand"); }
+                assert!(row(2).contains("TEST"), "keep the service name in the brand");
+                assert_eq!(screen.matches(&version).count(), 1, "version appears exactly once");
+                assert!(row(49).trim_end().ends_with(&version), "version remains bottom-right");
+            }
+        }
+    }
+
+    #[test]
+    fn home_cards_render_wide_narrow_loading_missing_and_error_states() {
+        let mut a = app();
+        a.load_home();
+        settle(&mut a);
+        let preview = std::sync::Arc::new(crate::cover::Preview::from_luma(std::array::from_fn(|i| (i % 256) as u8)));
+        for index in 0..3 { a.home.set_preview(index, preview.clone()); }
+        for lang in [Lang::Ru, Lang::En] {
+            a.lang = lang;
+            a.focus = crate::app::Focus::List;
+            a.selected = 1;
+            let wide = render(&a, 160, 50);
+            for kind in crate::home::Kind::ALL { assert!(wide.contains(kind.title(lang)), "{wide}"); }
+            assert!(wide.contains("‹ 2 / 3 ›"));
+            let narrow = render(&a, 96, 28);
+            assert!(narrow.contains("2 / 3"));
+            assert!(!narrow.contains("1 / 3"));
+            for (w, h) in [(1, 1), (20, 6), (40, 12), (60, 20), (80, 24), (130, 40), (200, 60)] {
+                render(&a, w, h);
+            }
+        }
+        a.lang = Lang::Ru;
+        a.home = crate::home::Home::default();
+        a.home.loading = true;
+        assert!(render(&a, 160, 50).contains("Загрузка…"));
+        a.home.loading = false;
+        a.home.failed = true;
+        assert!(render(&a, 160, 50).contains("Enter: повторить"));
+        a.home.failed = false;
+        a.home.loaded = true;
+        assert!(render(&a, 160, 50).contains("Пока недоступен"));
+    }
+
+    /// Offline Home snapshot: optional image bytes, no catalogue or playback I/O.
+    #[test]
+    #[ignore]
+    fn dump_home_screen() {
+        let mut a = app();
+        a.load_home();
+        settle(&mut a);
+        a.focus = crate::app::Focus::List;
+        a.selected = 1;
+        #[cfg(target_os = "macos")]
+        if let Ok(path) = std::env::var("YAMUSIQ_PREVIEW_IMAGE") {
+            let bytes = std::fs::read(path).unwrap();
+            let preview = crate::media::preview_for_test(&bytes).unwrap();
+            for index in 0..3 { a.home.set_preview(index, preview.clone()); }
+        }
+        for (w, h) in [(130u16, 40u16), (96, 28), (160, 50)] {
+            let terminal = term(&a, w, h);
+            let buf = terminal.backend().buffer();
+            if let Ok(path) = std::env::var("YAMUSIQ_PREVIEW_FRAME") {
+                let color = |c: ratatui::style::Color| match c {
+                    ratatui::style::Color::Rgb(r,g,b) => format!("#{r:02x}{g:02x}{b:02x}"),
+                    _ => "#111113".into(),
+                };
+                let cells = buf.content().iter().map(|c| (c.symbol(), color(c.fg), color(c.bg))).collect::<Vec<_>>();
+                std::fs::write(format!("{path}-{w}x{h}.json"), serde_json::to_vec(&serde_json::json!({"width":w,"height":h,"cells":cells})).unwrap()).unwrap();
+            }
+            for y in 0..h { println!("{}", (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>()); }
+        }
+    }
+
     /// Debug helper: `cargo test dump_screen -- --ignored --nocapture`.
     /// `YAMUSIQ_DUMP_AT=38` picks the playback position in seconds.
     #[test]
@@ -997,14 +1196,34 @@ mod tests {
     fn dump_screen() {
         let at = std::env::var("YAMUSIQ_DUMP_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(37);
         let mut a = playing_at(at);
-        // Let real time pass so the analyser, peaks and signal fill in.
+        #[cfg(target_os = "macos")]
+        if let Ok(path) = std::env::var("YAMUSIQ_PREVIEW_IMAGE") {
+            let bytes = std::fs::read(path).unwrap();
+            let id = a.current_track().unwrap().id.clone();
+            a.cover_preview = crate::media::preview_for_test(&bytes).map(|preview| (id, preview));
+            a.quality = Some("FLAC · lossless".into());
+        }
+        // Optional long-title fixture for visually checking the card layout.
+        if std::env::var_os("YAMUSIQ_PREVIEW_LAYOUT").is_some() {
+            a.queue[a.queue_pos.unwrap()].title = "Static Bloom — A Longer Version Recorded Under the Northern Lights".into();
+
+        }
+        // Let real time pass so the analyser and peaks fill in.
         for _ in 0..24 {
             std::thread::sleep(Duration::from_millis(95));
             a.tick();
         }
-        for (w, h) in [(130u16, 40u16), (96, 28)] {
+        for (w, h) in [(130u16, 40u16), (96, 28), (130, 65)] {
             let t = term(&a, w, h);
             let buf = t.backend().buffer();
+            if let Ok(path) = std::env::var("YAMUSIQ_PREVIEW_FRAME") {
+                let color = |c: ratatui::style::Color| match c {
+                    ratatui::style::Color::Rgb(r,g,b) => format!("#{r:02x}{g:02x}{b:02x}"),
+                    _ => "#111113".into(),
+                };
+                let cells = buf.content().iter().map(|c| (c.symbol(), color(c.fg), color(c.bg))).collect::<Vec<_>>();
+                std::fs::write(format!("{path}-{w}x{h}.json"), serde_json::to_vec(&serde_json::json!({"width":w,"height":h,"cells":cells})).unwrap()).unwrap();
+            }
             for y in 0..h {
                 println!("{}", (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>());
             }

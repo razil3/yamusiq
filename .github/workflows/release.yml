@@ -1,84 +1,63 @@
 name: release
 
-# Tag a commit (git tag -a v0.1.3 -m "…") and push it: this builds both
-# architectures on matching runners and attaches the archives to the release.
+# Tagging still publishes a release. Packaging is the same as local dist.sh.
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14
-            target: aarch64-apple-darwin
-            arch: arm64
-          # macos-13 (the last Intel image) is retired for public repositories,
-          # so the Intel slice is cross-compiled on the arm64 runner instead.
-          - runner: macos-14
-            target: x86_64-apple-darwin
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-14
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Install Rust
+      - name: Install Rust and both macOS targets
         run: |
           rustup toolchain install stable --profile minimal
-          rustup target add ${{ matrix.target }}
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Pack
+      - name: Check tag matches Cargo version
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/yamusiq" dist/yamusiq
-          tar -czf "dist/yamusiq-$version-${{ matrix.arch }}.tar.gz" -C dist yamusiq
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test "$GITHUB_REF_NAME" = "v$version"
+
+      - name: Build, bundle and smoke-test all release archives
+        run: sh scripts/dist.sh --output "$RUNNER_TEMP/release-dist"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: yamusiq-${{ matrix.arch }}
-          path: dist/*.tar.gz
+          name: release-archives
+          path: |
+            ${{ runner.temp }}/release-dist/*.tar.gz
+            ${{ runner.temp }}/release-dist/SHA256SUMS
+          if-no-files-found: error
 
   publish:
     needs: build
     runs-on: macos-14
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
+          name: release-archives
           path: dist
-          merge-multiple: true
 
-      - name: Make the universal binary
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          for arch in arm64 x86_64; do
-            tar -xzf "dist/yamusiq-$version-$arch.tar.gz" -C dist
-            mv dist/yamusiq "dist/yamusiq-$arch"
-          done
-          lipo -create -output dist/yamusiq dist/yamusiq-arm64 dist/yamusiq-x86_64
-          tar -czf "dist/yamusiq-$version-universal.tar.gz" -C dist yamusiq
-          rm -f dist/yamusiq dist/yamusiq-arm64 dist/yamusiq-x86_64
-
-      - name: Checksums
-        run: |
-          cd dist
-          : > SHA256SUMS
-          for f in *.tar.gz; do shasum -a 256 "$f" >> SHA256SUMS; done
-          cat SHA256SUMS
+      - name: Verify checksums
+        working-directory: dist
+        run: shasum -a 256 -c SHA256SUMS
 
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \

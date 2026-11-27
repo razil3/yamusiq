@@ -55,7 +55,7 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
     echo "yamusiq: note — ffmpeg is required for playback: brew install ffmpeg"
 fi
 
-tmp="$(mktemp -d)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/yamusiq.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
 file="yamusiq-${VERSION#v}-${arch}.tar.gz"
@@ -94,7 +94,33 @@ if [ -z "$bin_dir" ]; then
     fi
 fi
 mkdir -p "$bin_dir"
-install -m 755 "$tmp/yamusiq" "$bin_dir/yamusiq"
+if [ -d "$tmp/yamusiq.app" ]; then
+    app_dir="${YAMUSIQ_APP_DIR:-$HOME/Applications}"
+    mkdir -p "$app_dir"
+    app_dir="$(CDPATH= cd -- "$app_dir" && pwd)"
+    app="$app_dir/yamusiq.app"
+    /usr/bin/codesign --verify --deep --strict "$tmp/yamusiq.app"
+    if [ -e "$app" ] || [ -L "$app" ]; then
+        if [ -L "$app" ] || [ "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist" 2>/dev/null || true)" != "io.github.razil3.yamusiq" ]; then
+            echo "yamusiq: refusing to replace an unrelated app: $app" >&2
+            exit 1
+        fi
+        mv "$app" "$tmp/previous.app"
+    fi
+    if ! /usr/bin/ditto "$tmp/yamusiq.app" "$app"; then
+        # Preserve the previous install on a copy failure.
+        if [ -d "$tmp/previous.app" ]; then
+            rm -rf "$app"
+            /usr/bin/ditto "$tmp/previous.app" "$app"
+        fi
+        exit 1
+    fi
+    ln -sf "$app/Contents/MacOS/yamusiq" "$bin_dir/yamusiq"
+    echo "yamusiq: application installed to $app (no Dock icon)"
+else
+    # Keep older single-binary releases installable.
+    install -m 755 "$tmp/yamusiq" "$bin_dir/yamusiq"
+fi
 
 echo "yamusiq: installed to $bin_dir/yamusiq"
 case ":$PATH:" in

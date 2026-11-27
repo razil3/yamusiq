@@ -1,0 +1,5 @@
+#!/bin/sh
+# Run from an unpacked release without changing the current terminal.
+set -eu
+here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+exec "$here/yamusiq.app/Contents/MacOS/yamusiq" "$@"

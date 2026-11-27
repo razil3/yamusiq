@@ -232,6 +232,11 @@ impl MusicService for YandexService {
         Ok(self.mark(parse::tracks(&items)))
     }
 
+    fn home_playlists(&self) -> Result<Vec<crate::home::Recommendation>> {
+        let result = self.client.get("/landing3", &[("blocks", "personal-playlists")])?;
+        Ok(parse::home_playlists(&result, self.uid))
+    }
+
     fn playlists(&self) -> Result<Vec<Playlist>> {
         let res = self.client.get(&format!("/users/{}/playlists/list", self.uid), &[])?;
         Ok(res.as_array().into_iter().flatten().filter_map(|v| parse::playlist(v, self.uid)).collect())
